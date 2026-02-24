@@ -1,13 +1,16 @@
 import express from 'express';
 import cors from 'cors';
+import multer from 'multer';
 import { config } from 'dotenv';
 import { fileURLToPath } from 'url';
 import path from 'path';
 import fs from 'fs';
+import os from 'os';
 import { downloadYouTubeAudio, downloadYouTubeVideo, mergeVideoAudio, extractVideoId, cleanupAudioFile } from './services/youtube.js';
 import { transcribeAudio } from './services/transcriber.js';
 import { translateText } from './services/translator.js';
 import { splitForTTS, generateSpeechChunk } from './services/tts.js';
+import { extractTextFromFile } from './services/document-parser.js';
 
 config();
 
@@ -16,6 +19,12 @@ const app = express();
 
 app.use(cors());
 app.use(express.json());
+
+// Multer for file uploads (50MB limit)
+const upload = multer({
+  dest: path.join(os.tmpdir(), 'harmony-voice-uploads'),
+  limits: { fileSize: 50 * 1024 * 1024 },
+});
 
 // Serve generated audio files
 const outputDir = path.join(__dirname, 'output');
@@ -32,11 +41,55 @@ function sendSSE(res: express.Response, data: any) {
   res.write(`data: ${JSON.stringify(data)}\n\n`);
 }
 
-// Main processing endpoint (SSE stream with streaming TTS)
+// Shared: streaming TTS pipeline (used by both YouTube and file processing)
+async function streamingTTS(
+  res: express.Response,
+  translatedText: string,
+  filePrefix: string,
+  targetLanguage: string,
+): Promise<string> {
+  sendSSE(res, { step: 'tts', message: "Génération de l'audio traduit..." });
+
+  const ttsChunks = splitForTTS(translatedText);
+  const audioBuffers: Buffer[] = [];
+  const timestamp = Date.now();
+
+  console.log(`[TTS] Streaming: ${ttsChunks.length} chunks to generate`);
+
+  for (let i = 0; i < ttsChunks.length; i++) {
+    const buffer = await generateSpeechChunk(ttsChunks[i]);
+    audioBuffers.push(buffer);
+
+    const chunkFileName = `${filePrefix}_${targetLanguage}_${timestamp}_chunk${i}.mp3`;
+    fs.writeFileSync(path.join(outputDir, chunkFileName), buffer);
+
+    sendSSE(res, {
+      step: 'audio_chunk',
+      data: {
+        index: i,
+        total: ttsChunks.length,
+        audioUrl: `/api/audio/${chunkFileName}`,
+      }
+    });
+
+    sendSSE(res, {
+      step: 'tts_progress',
+      data: { progress: Math.round(((i + 1) / ttsChunks.length) * 100) }
+    });
+  }
+
+  const finalFileName = `${filePrefix}_${targetLanguage}_${timestamp}.mp3`;
+  const finalPath = path.join(outputDir, finalFileName);
+  fs.writeFileSync(finalPath, Buffer.concat(audioBuffers));
+
+  console.log(`[TTS] Final audio saved: ${finalFileName}`);
+  return `/api/audio/${finalFileName}`;
+}
+
+// ===== YouTube processing (SSE stream) =====
 app.post('/api/process', async (req, res) => {
   const { url, targetLanguage = 'fr' } = req.body;
 
-  // Set SSE headers
   res.setHeader('Content-Type', 'text/event-stream');
   res.setHeader('Cache-Control', 'no-cache');
   res.setHeader('Connection', 'keep-alive');
@@ -46,117 +99,123 @@ app.post('/api/process', async (req, res) => {
   let audioPath: string | null = null;
 
   try {
-    // Validate URL
     const videoId = extractVideoId(url);
     if (!videoId) {
-      sendSSE(res, { step: 'error', message: 'URL YouTube invalide. Formats acceptés: youtube.com/watch?v=..., youtu.be/...' });
+      sendSSE(res, { step: 'error', message: 'URL YouTube invalide.' });
       return res.end();
     }
 
-    // Validate API keys
     if (!process.env.OPENAI_API_KEY && !process.env.GROQ_API_KEY) {
-      sendSSE(res, { step: 'error', message: 'Aucune clé API configurée. Ajoutez GROQ_API_KEY ou OPENAI_API_KEY dans le fichier .env' });
+      sendSSE(res, { step: 'error', message: 'Aucune clé API configurée. Ajoutez GROQ_API_KEY ou OPENAI_API_KEY dans .env' });
       return res.end();
     }
 
-    // Step 1: Download audio from YouTube
+    // Step 1: Download audio
     sendSSE(res, { step: 'download', message: 'Extraction audio de la vidéo YouTube...' });
-
     audioPath = await downloadYouTubeAudio(videoId);
-
     const fileSize = (fs.statSync(audioPath).size / 1024 / 1024).toFixed(1);
     sendSSE(res, { step: 'download_done', data: { fileSize: `${fileSize}MB` } });
 
-    // Step 2: Transcribe with Whisper
+    // Step 2: Transcribe
     sendSSE(res, { step: 'transcript', message: 'Transcription avec Whisper IA...' });
-
     const { text: fullTranscript, segments } = await transcribeAudio(audioPath);
-
     console.log(`[Process] Transcript: ${segments.length} segments, ${fullTranscript.length} chars`);
+    sendSSE(res, { step: 'transcript_done', data: { transcript: fullTranscript, segmentCount: segments.length } });
 
-    sendSSE(res, {
-      step: 'transcript_done',
-      data: { transcript: fullTranscript, segmentCount: segments.length }
-    });
-
-    // Clean up source audio file (no longer needed)
     cleanupAudioFile(audioPath);
     audioPath = null;
 
     // Step 3: Translate
     sendSSE(res, { step: 'translating', message: 'Traduction en cours...' });
-
     const translatedText = await translateText(fullTranscript, targetLanguage, (progress) => {
       sendSSE(res, { step: 'translating_progress', data: { progress } });
     });
-
     console.log(`[Process] Translation done: ${translatedText.length} chars`);
-
     sendSSE(res, { step: 'translation_done', data: { translatedText } });
 
-    // Step 4: Streaming TTS - send each chunk as it's generated
-    sendSSE(res, { step: 'tts', message: "Génération de l'audio traduit..." });
+    // Step 4: Streaming TTS
+    const audioUrl = await streamingTTS(res, translatedText, videoId, targetLanguage);
 
-    const ttsChunks = splitForTTS(translatedText);
-    const audioBuffers: Buffer[] = [];
-    const timestamp = Date.now();
-
-    console.log(`[Process] TTS streaming: ${ttsChunks.length} chunks to generate`);
-
-    for (let i = 0; i < ttsChunks.length; i++) {
-      const buffer = await generateSpeechChunk(ttsChunks[i]);
-      audioBuffers.push(buffer);
-
-      // Save individual chunk for streaming playback
-      const chunkFileName = `${videoId}_${targetLanguage}_${timestamp}_chunk${i}.mp3`;
-      fs.writeFileSync(path.join(outputDir, chunkFileName), buffer);
-
-      // Stream chunk URL to client immediately
-      sendSSE(res, {
-        step: 'audio_chunk',
-        data: {
-          index: i,
-          total: ttsChunks.length,
-          audioUrl: `/api/audio/${chunkFileName}`,
-        }
-      });
-
-      sendSSE(res, {
-        step: 'tts_progress',
-        data: { progress: Math.round(((i + 1) / ttsChunks.length) * 100) }
-      });
-    }
-
-    // Save final concatenated file
-    const finalFileName = `${videoId}_${targetLanguage}_${timestamp}.mp3`;
-    const finalPath = path.join(outputDir, finalFileName);
-    fs.writeFileSync(finalPath, Buffer.concat(audioBuffers));
-
-    console.log(`[Process] Final audio saved: ${finalFileName}`);
-
-    // Done!
     sendSSE(res, {
       step: 'done',
-      data: {
-        audioUrl: `/api/audio/${finalFileName}`,
-        translatedText,
-        transcript: fullTranscript,
-        videoId,
-      }
+      data: { audioUrl, translatedText, transcript: fullTranscript, videoId }
     });
 
   } catch (error: any) {
     console.error('[Process] Error:', error.message);
-    sendSSE(res, { step: 'error', message: error.message || 'Erreur inattendue lors du traitement' });
-
-    // Clean up on error
+    sendSSE(res, { step: 'error', message: error.message || 'Erreur inattendue' });
     if (audioPath) cleanupAudioFile(audioPath);
   }
 
   res.end();
 });
 
-// Merge translated audio into video for download
+// ===== File processing (PDF/DOCX/TXT → translate → TTS) =====
+app.post('/api/process-file', upload.single('file'), async (req, res) => {
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+  res.setHeader('X-Accel-Buffering', 'no');
+  res.flushHeaders();
+
+  const file = req.file;
+  const targetLanguage = req.body?.targetLanguage || 'fr';
+
+  if (!file) {
+    sendSSE(res, { step: 'error', message: 'Aucun fichier reçu.' });
+    return res.end();
+  }
+
+  if (!process.env.OPENAI_API_KEY && !process.env.GROQ_API_KEY) {
+    sendSSE(res, { step: 'error', message: 'Aucune clé API configurée. Ajoutez GROQ_API_KEY ou OPENAI_API_KEY dans .env' });
+    cleanupAudioFile(file.path);
+    return res.end();
+  }
+
+  try {
+    // Step 1: Extract text from document
+    sendSSE(res, { step: 'extract', message: 'Extraction du texte du document...' });
+
+    const originalText = await extractTextFromFile(file.path, file.originalname);
+
+    console.log(`[FileProcess] Extracted ${originalText.length} chars from ${file.originalname}`);
+    sendSSE(res, {
+      step: 'extract_done',
+      data: { text: originalText, charCount: originalText.length }
+    });
+
+    // Cleanup uploaded file
+    cleanupAudioFile(file.path);
+
+    // Step 2: Translate
+    sendSSE(res, { step: 'translating', message: 'Traduction en cours...' });
+
+    const translatedText = await translateText(originalText, targetLanguage, (progress) => {
+      sendSSE(res, { step: 'translating_progress', data: { progress } });
+    });
+
+    console.log(`[FileProcess] Translation done: ${translatedText.length} chars`);
+    sendSSE(res, { step: 'translation_done', data: { translatedText } });
+
+    // Step 3: Streaming TTS
+    const filePrefix = `doc_${Date.now()}`;
+    const audioUrl = await streamingTTS(res, translatedText, filePrefix, targetLanguage);
+
+    sendSSE(res, {
+      step: 'done',
+      data: { audioUrl, translatedText, transcript: originalText }
+    });
+
+  } catch (error: any) {
+    console.error('[FileProcess] Error:', error.message);
+    sendSSE(res, { step: 'error', message: error.message || 'Erreur inattendue' });
+    if (file) cleanupAudioFile(file.path);
+  }
+
+  res.end();
+});
+
+// ===== Merge video + translated audio =====
 app.post('/api/merge-video', async (req, res) => {
   const { videoId, audioUrl } = req.body;
 
@@ -164,7 +223,6 @@ app.post('/api/merge-video', async (req, res) => {
     return res.status(400).json({ error: 'videoId et audioUrl requis' });
   }
 
-  // Resolve the audio file path from the URL
   const audioFileName = path.basename(audioUrl);
   const audioPath = path.join(outputDir, audioFileName);
 
@@ -176,18 +234,14 @@ app.post('/api/merge-video', async (req, res) => {
 
   try {
     console.log(`[Merge] Downloading video for ${videoId}...`);
-
-    // Download original video
     videoPath = await downloadYouTubeVideo(videoId);
 
-    // Merge video + translated audio
     const mergedFileName = `${videoId}_translated_${Date.now()}.mp4`;
     const mergedPath = path.join(videoOutputDir, mergedFileName);
 
     console.log(`[Merge] Merging video + translated audio...`);
     await mergeVideoAudio(videoPath, audioPath, mergedPath);
 
-    // Clean up temp video
     cleanupAudioFile(videoPath);
 
     const stats = fs.statSync(mergedPath);
@@ -217,5 +271,5 @@ const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => {
   console.log(`Server running on http://localhost:${PORT}`);
   console.log(`OpenAI API key: ${process.env.OPENAI_API_KEY ? 'configured' : 'MISSING'}`);
-  console.log(`Groq API key: ${process.env.GROQ_API_KEY ? 'configured (Whisper + translation)' : 'not set (using OpenAI for Whisper + translation)'}`);
+  console.log(`Groq API key: ${process.env.GROQ_API_KEY ? 'configured (Whisper + translation)' : 'not set (using OpenAI)'}`);
 });

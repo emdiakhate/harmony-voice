@@ -77,7 +77,7 @@ const FileDropZone = ({ onFileSelect, selectedFile, onClear }: FileDropZoneProps
     >
       <input
         type="file"
-        accept="audio/*,video/*,.mp3,.mp4,.wav,.avi,.mkv,.webm"
+        accept=".pdf,.docx,.doc,.txt,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document,text/plain"
         onChange={handleFileInput}
         className="hidden"
       />
@@ -89,10 +89,10 @@ const FileDropZone = ({ onFileSelect, selectedFile, onClear }: FileDropZoneProps
       </motion.div>
       <div className="text-center">
         <p className="text-foreground font-medium">
-          Glissez votre fichier ici
+          Glissez votre document ici
         </p>
         <p className="text-sm text-muted-foreground mt-1">
-          MP3, MP4, WAV, AVI, MKV • Max 500 Mo
+          PDF, Word (.docx), Texte (.txt) • Max 50 Mo
         </p>
       </div>
     </label>

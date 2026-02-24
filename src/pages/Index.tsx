@@ -14,6 +14,7 @@ import {
   AlertCircle,
   XCircle,
   Download,
+  Music,
 } from "lucide-react";
 import FileDropZone from "@/components/FileDropZone";
 import LanguageSelector from "@/components/LanguageSelector";
@@ -36,6 +37,42 @@ function extractVideoId(url: string): string | null {
     /(?:youtube\.com\/watch\?v=|youtu\.be\/|youtube\.com\/embed\/|youtube\.com\/shorts\/)([a-zA-Z0-9_-]{11})/
   );
   return match ? match[1] : null;
+}
+
+// SSE stream reader (shared between YouTube and file modes)
+async function readSSEStream(
+  response: Response,
+  onEvent: (data: any) => void
+) {
+  const reader = response.body!.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+
+    buffer += decoder.decode(value, { stream: true });
+    const lines = buffer.split("\n\n");
+    buffer = lines.pop() || "";
+
+    for (const line of lines) {
+      if (!line.startsWith("data: ")) continue;
+      try {
+        onEvent(JSON.parse(line.slice(6)));
+      } catch {
+        // Skip malformed events
+      }
+    }
+  }
+
+  if (buffer.startsWith("data: ")) {
+    try {
+      onEvent(JSON.parse(buffer.slice(6)));
+    } catch {
+      // Skip
+    }
+  }
 }
 
 const Index = () => {
@@ -64,7 +101,7 @@ const Index = () => {
       return;
     }
     if (inputMode === "file" && !selectedFile) {
-      toast.error("Veuillez ajouter un fichier audio/vidéo");
+      toast.error("Veuillez ajouter un fichier");
       return;
     }
 
@@ -77,62 +114,54 @@ const Index = () => {
     setIsTtsStreaming(false);
     setErrorMessage("");
     setVideoId("");
-    setSteps([
-      { id: "download", label: "Extraction audio YouTube", status: "pending" },
-      { id: "transcript", label: "Transcription Whisper IA", status: "pending" },
-      { id: "translating", label: "Traduction", status: "pending" },
-      { id: "tts", label: "Génération de l'audio", status: "pending" },
-    ]);
+
+    // Different steps depending on mode
+    if (inputMode === "url") {
+      setSteps([
+        { id: "download", label: "Extraction audio YouTube", status: "pending" },
+        { id: "transcript", label: "Transcription Whisper IA", status: "pending" },
+        { id: "translating", label: "Traduction", status: "pending" },
+        { id: "tts", label: "Génération de l'audio", status: "pending" },
+      ]);
+    } else {
+      setSteps([
+        { id: "extract", label: "Extraction du texte", status: "pending" },
+        { id: "translating", label: "Traduction", status: "pending" },
+        { id: "tts", label: "Génération de l'audio", status: "pending" },
+      ]);
+    }
 
     abortRef.current = new AbortController();
 
     try {
-      const response = await fetch("/api/process", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          url: youtubeUrl,
-          targetLanguage: targetLang,
-        }),
-        signal: abortRef.current.signal,
-      });
+      let response: Response;
+
+      if (inputMode === "url") {
+        // YouTube mode
+        response = await fetch("/api/process", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ url: youtubeUrl, targetLanguage: targetLang }),
+          signal: abortRef.current.signal,
+        });
+      } else {
+        // File upload mode
+        const formData = new FormData();
+        formData.append("file", selectedFile!);
+        formData.append("targetLanguage", targetLang);
+
+        response = await fetch("/api/process-file", {
+          method: "POST",
+          body: formData,
+          signal: abortRef.current.signal,
+        });
+      }
 
       if (!response.ok) {
         throw new Error("Erreur serveur. Vérifiez que le backend est lancé.");
       }
 
-      const reader = response.body!.getReader();
-      const decoder = new TextDecoder();
-      let buffer = "";
-
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-
-        buffer += decoder.decode(value, { stream: true });
-        const lines = buffer.split("\n\n");
-        buffer = lines.pop() || "";
-
-        for (const line of lines) {
-          if (!line.startsWith("data: ")) continue;
-          try {
-            const data = JSON.parse(line.slice(6));
-            handleSSEEvent(data);
-          } catch {
-            // Skip malformed events
-          }
-        }
-      }
-
-      // Handle remaining buffer
-      if (buffer.startsWith("data: ")) {
-        try {
-          const data = JSON.parse(buffer.slice(6));
-          handleSSEEvent(data);
-        } catch {
-          // Skip
-        }
-      }
+      await readSSEStream(response, handleSSEEvent);
     } catch (error: any) {
       if (error.name !== "AbortError") {
         const msg = error.message?.includes("Failed to fetch")
@@ -156,78 +185,70 @@ const Index = () => {
 
   const handleSSEEvent = (data: any) => {
     switch (data.step) {
+      // YouTube-specific steps
       case "download":
         setSteps((prev) =>
-          prev.map((s) =>
-            s.id === "download" ? { ...s, status: "active" } : s
-          )
+          prev.map((s) => (s.id === "download" ? { ...s, status: "active" } : s))
         );
         break;
-
       case "download_done":
         setSteps((prev) =>
-          prev.map((s) =>
-            s.id === "download" ? { ...s, status: "done" } : s
-          )
+          prev.map((s) => (s.id === "download" ? { ...s, status: "done" } : s))
         );
         break;
-
       case "transcript":
         setSteps((prev) =>
-          prev.map((s) =>
-            s.id === "transcript" ? { ...s, status: "active" } : s
-          )
+          prev.map((s) => (s.id === "transcript" ? { ...s, status: "active" } : s))
         );
         break;
-
       case "transcript_done":
         setTranscription(data.data.transcript);
         setSteps((prev) =>
-          prev.map((s) =>
-            s.id === "transcript" ? { ...s, status: "done" } : s
-          )
+          prev.map((s) => (s.id === "transcript" ? { ...s, status: "done" } : s))
         );
         break;
 
+      // File-specific steps
+      case "extract":
+        setSteps((prev) =>
+          prev.map((s) => (s.id === "extract" ? { ...s, status: "active" } : s))
+        );
+        break;
+      case "extract_done":
+        setTranscription(data.data.text);
+        setSteps((prev) =>
+          prev.map((s) => (s.id === "extract" ? { ...s, status: "done" } : s))
+        );
+        break;
+
+      // Shared steps
       case "translating":
         setSteps((prev) =>
-          prev.map((s) =>
-            s.id === "translating" ? { ...s, status: "active" } : s
-          )
+          prev.map((s) => (s.id === "translating" ? { ...s, status: "active" } : s))
         );
         break;
-
       case "translating_progress":
         setSteps((prev) =>
           prev.map((s) =>
-            s.id === "translating"
-              ? { ...s, progress: data.data.progress }
-              : s
+            s.id === "translating" ? { ...s, progress: data.data.progress } : s
           )
         );
         break;
-
       case "translation_done":
         setTranslation(data.data.translatedText);
         setSteps((prev) =>
-          prev.map((s) =>
-            s.id === "translating" ? { ...s, status: "done" } : s
-          )
+          prev.map((s) => (s.id === "translating" ? { ...s, status: "done" } : s))
         );
         break;
-
       case "tts":
         setIsTtsStreaming(true);
         setSteps((prev) =>
           prev.map((s) => (s.id === "tts" ? { ...s, status: "active" } : s))
         );
         break;
-
       case "audio_chunk":
-        // Append new chunk URL for streaming playback
         setAudioChunks((prev) => [...prev, data.data.audioUrl]);
         break;
-
       case "tts_progress":
         setSteps((prev) =>
           prev.map((s) =>
@@ -235,7 +256,6 @@ const Index = () => {
           )
         );
         break;
-
       case "done":
         setAudioUrl(data.data.audioUrl);
         setIsTtsStreaming(false);
@@ -245,7 +265,6 @@ const Index = () => {
         setSteps((prev) => prev.map((s) => ({ ...s, status: "done" })));
         toast.success("Traitement terminé !");
         break;
-
       case "error":
         setErrorMessage(data.message);
         setIsTtsStreaming(false);
@@ -287,7 +306,6 @@ const Index = () => {
         throw new Error(result.error || "Erreur lors de la fusion vidéo");
       }
 
-      // Trigger download
       const a = document.createElement("a");
       a.href = result.videoUrl;
       a.download = `${videoId}_traduit.mp4`;
@@ -345,8 +363,8 @@ const Index = () => {
             <span className="text-primary"> instantanément</span>
           </h2>
           <p className="text-muted-foreground max-w-xl mx-auto">
-            Collez un lien YouTube pour obtenir la traduction audio en français.
-            Regardez la vidéo et écoutez en français simultanément.
+            Collez un lien YouTube ou importez un document (PDF, Word) pour
+            obtenir la traduction audio dans la langue de votre choix.
           </p>
         </motion.section>
 
@@ -368,7 +386,7 @@ const Index = () => {
               }`}
             >
               <FileAudio className="w-4 h-4" />
-              Fichier
+              Document
             </button>
             <button
               onClick={() => setInputMode("url")}
@@ -437,7 +455,7 @@ const Index = () => {
               className="w-full py-4 rounded-xl bg-primary text-primary-foreground font-display font-semibold text-base hover:brightness-110 transition-all flex items-center justify-center gap-2"
             >
               <Mic className="w-5 h-5" />
-              Transcrire & Traduire
+              {inputMode === "file" ? "Traduire & Générer l'audio" : "Transcrire & Traduire"}
             </button>
           )}
         </motion.section>
@@ -511,7 +529,7 @@ const Index = () => {
           )}
         </AnimatePresence>
 
-        {/* Video + Audio Section */}
+        {/* Video + Audio Section (YouTube mode) */}
         <AnimatePresence>
           {displayVideoId && (
             <motion.section
@@ -520,38 +538,59 @@ const Index = () => {
               className="space-y-4"
             >
               <YouTubePlayer videoId={displayVideoId} />
-              {showAudioPlayer && (
-                <AudioPlayer
-                  audioChunks={audioChunks}
-                  audioUrl={audioUrl || undefined}
-                  isStreaming={isTtsStreaming}
-                  title="Audio traduit en français"
-                />
-              )}
-              {/* Download translated video button */}
-              {audioUrl && videoId && (
-                <motion.div
-                  initial={{ opacity: 0, y: 10 }}
-                  animate={{ opacity: 1, y: 0 }}
-                >
-                  <button
-                    onClick={handleDownloadVideo}
-                    disabled={isDownloadingVideo}
-                    className="w-full py-3 rounded-xl bg-muted border border-border text-foreground font-medium text-sm hover:bg-muted/80 transition-all flex items-center justify-center gap-2 disabled:opacity-50"
+            </motion.section>
+          )}
+        </AnimatePresence>
+
+        {/* Audio Player (both modes) */}
+        <AnimatePresence>
+          {showAudioPlayer && (
+            <motion.section
+              initial={{ opacity: 0, y: 20 }}
+              animate={{ opacity: 1, y: 0 }}
+              className="space-y-3"
+            >
+              <AudioPlayer
+                audioChunks={audioChunks}
+                audioUrl={audioUrl || undefined}
+                isStreaming={isTtsStreaming}
+                title="Audio traduit"
+              />
+
+              {/* Download buttons */}
+              {audioUrl && (
+                <div className="flex gap-3">
+                  {/* Download MP3 */}
+                  <a
+                    href={audioUrl}
+                    download="audio_traduit.mp3"
+                    className="flex-1 py-3 rounded-xl bg-muted border border-border text-foreground font-medium text-sm hover:bg-muted/80 transition-all flex items-center justify-center gap-2"
                   >
-                    {isDownloadingVideo ? (
-                      <>
-                        <Loader2 className="w-4 h-4 animate-spin" />
-                        Fusion vidéo + audio traduit en cours...
-                      </>
-                    ) : (
-                      <>
-                        <Download className="w-4 h-4" />
-                        Télécharger la vidéo traduite (.mp4)
-                      </>
-                    )}
-                  </button>
-                </motion.div>
+                    <Music className="w-4 h-4" />
+                    Télécharger l'audio (.mp3)
+                  </a>
+
+                  {/* Download translated video (YouTube mode only) */}
+                  {videoId && (
+                    <button
+                      onClick={handleDownloadVideo}
+                      disabled={isDownloadingVideo}
+                      className="flex-1 py-3 rounded-xl bg-muted border border-border text-foreground font-medium text-sm hover:bg-muted/80 transition-all flex items-center justify-center gap-2 disabled:opacity-50"
+                    >
+                      {isDownloadingVideo ? (
+                        <>
+                          <Loader2 className="w-4 h-4 animate-spin" />
+                          Fusion en cours...
+                        </>
+                      ) : (
+                        <>
+                          <Download className="w-4 h-4" />
+                          Télécharger la vidéo traduite (.mp4)
+                        </>
+                      )}
+                    </button>
+                  )}
+                </div>
               )}
             </motion.section>
           )}
@@ -561,7 +600,7 @@ const Index = () => {
         {(transcription || translation || isProcessing) && (
           <section className="grid md:grid-cols-2 gap-6">
             <ResultsPanel
-              title="Transcription originale"
+              title={inputMode === "file" ? "Texte original" : "Transcription originale"}
               content={transcription}
               icon={<FileText className="w-5 h-5 text-teal-light" />}
               isLoading={isProcessing && !transcription}
