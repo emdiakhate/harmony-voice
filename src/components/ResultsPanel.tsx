@@ -1,5 +1,6 @@
+import { useState } from "react";
 import { motion } from "framer-motion";
-import { Copy, Download } from "lucide-react";
+import { Copy, Download, ChevronDown, ChevronUp } from "lucide-react";
 import { toast } from "sonner";
 
 interface ResultsPanelProps {
@@ -7,9 +8,30 @@ interface ResultsPanelProps {
   content: string;
   icon: React.ReactNode;
   isLoading?: boolean;
+  previewLines?: number;
 }
 
-const ResultsPanel = ({ title, content, icon, isLoading }: ResultsPanelProps) => {
+function getPreviewText(text: string, sentenceCount: number): { preview: string; isTruncated: boolean } {
+  // Split by sentence-ending punctuation followed by a space or end of string
+  const sentences = text.match(/[^.!?]*[.!?]+(\s|$)/g);
+  if (!sentences || sentences.length <= sentenceCount) {
+    return { preview: text, isTruncated: false };
+  }
+  return {
+    preview: sentences.slice(0, sentenceCount).join('').trim(),
+    isTruncated: true,
+  };
+}
+
+const ResultsPanel = ({ title, content, icon, isLoading, previewLines = 3 }: ResultsPanelProps) => {
+  const [expanded, setExpanded] = useState(false);
+
+  const { preview, isTruncated } = content
+    ? getPreviewText(content, previewLines)
+    : { preview: '', isTruncated: false };
+
+  const displayText = expanded ? content : preview;
+
   const handleCopy = () => {
     navigator.clipboard.writeText(content);
     toast.success("Copié dans le presse-papiers !");
@@ -62,7 +84,29 @@ const ResultsPanel = ({ title, content, icon, isLoading }: ResultsPanelProps) =>
             <p className="text-sm text-muted-foreground">Traitement en cours...</p>
           </div>
         ) : content ? (
-          <p className="text-sm text-foreground/90 leading-relaxed whitespace-pre-wrap">{content}</p>
+          <div>
+            <p className="text-sm text-foreground/90 leading-relaxed whitespace-pre-wrap">
+              {displayText}
+            </p>
+            {isTruncated && (
+              <button
+                onClick={() => setExpanded(!expanded)}
+                className="mt-3 flex items-center gap-1 text-sm text-primary hover:text-primary/80 font-medium transition-colors"
+              >
+                {expanded ? (
+                  <>
+                    <ChevronUp className="w-4 h-4" />
+                    Voir moins
+                  </>
+                ) : (
+                  <>
+                    <ChevronDown className="w-4 h-4" />
+                    Voir plus
+                  </>
+                )}
+              </button>
+            )}
+          </div>
         ) : (
           <p className="text-sm text-muted-foreground text-center mt-12">
             Le résultat apparaîtra ici
