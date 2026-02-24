@@ -4,7 +4,8 @@ import { config } from 'dotenv';
 import { fileURLToPath } from 'url';
 import path from 'path';
 import fs from 'fs';
-import { fetchYouTubeTranscript, extractVideoId } from './services/youtube.js';
+import { downloadYouTubeAudio, extractVideoId, cleanupAudioFile } from './services/youtube.js';
+import { transcribeAudio } from './services/transcriber.js';
 import { translateText } from './services/translator.js';
 import { generateSpeech } from './services/tts.js';
 
@@ -37,6 +38,8 @@ app.post('/api/process', async (req, res) => {
   res.setHeader('X-Accel-Buffering', 'no');
   res.flushHeaders();
 
+  let audioPath: string | null = null;
+
   try {
     // Validate URL
     const videoId = extractVideoId(url);
@@ -45,26 +48,37 @@ app.post('/api/process', async (req, res) => {
       return res.end();
     }
 
-    // Validate API key
-    if (!process.env.OPENAI_API_KEY) {
-      sendSSE(res, { step: 'error', message: 'Clé API OpenAI manquante. Ajoutez OPENAI_API_KEY dans le fichier .env' });
+    // Validate API keys
+    if (!process.env.OPENAI_API_KEY && !process.env.GROQ_API_KEY) {
+      sendSSE(res, { step: 'error', message: 'Aucune clé API configurée. Ajoutez GROQ_API_KEY ou OPENAI_API_KEY dans le fichier .env' });
       return res.end();
     }
 
-    // Step 1: Fetch YouTube transcript
-    sendSSE(res, { step: 'transcript', message: 'Récupération de la transcription YouTube...' });
+    // Step 1: Download audio from YouTube
+    sendSSE(res, { step: 'download', message: 'Extraction audio de la vidéo YouTube...' });
 
-    const segments = await fetchYouTubeTranscript(videoId);
-    const fullTranscript = segments.map(s => s.text).join(' ');
+    audioPath = await downloadYouTubeAudio(videoId);
 
-    console.log(`[Process] Transcript fetched: ${segments.length} segments, ${fullTranscript.length} chars`);
+    const fileSize = (fs.statSync(audioPath).size / 1024 / 1024).toFixed(1);
+    sendSSE(res, { step: 'download_done', data: { fileSize: `${fileSize}MB` } });
+
+    // Step 2: Transcribe with Whisper
+    sendSSE(res, { step: 'transcript', message: 'Transcription avec Whisper IA...' });
+
+    const { text: fullTranscript, segments } = await transcribeAudio(audioPath);
+
+    console.log(`[Process] Transcript: ${segments.length} segments, ${fullTranscript.length} chars`);
 
     sendSSE(res, {
       step: 'transcript_done',
       data: { transcript: fullTranscript, segmentCount: segments.length }
     });
 
-    // Step 2: Translate
+    // Clean up audio file (no longer needed)
+    cleanupAudioFile(audioPath);
+    audioPath = null;
+
+    // Step 3: Translate
     sendSSE(res, { step: 'translating', message: 'Traduction en cours...' });
 
     const translatedText = await translateText(fullTranscript, targetLanguage, (progress) => {
@@ -75,13 +89,13 @@ app.post('/api/process', async (req, res) => {
 
     sendSSE(res, { step: 'translation_done', data: { translatedText } });
 
-    // Step 3: Generate TTS audio
-    sendSSE(res, { step: 'tts', message: "Génération de l'audio..." });
+    // Step 4: Generate TTS audio
+    sendSSE(res, { step: 'tts', message: "Génération de l'audio traduit..." });
 
     const audioFileName = `${videoId}_${targetLanguage}_${Date.now()}.mp3`;
-    const audioPath = path.join(outputDir, audioFileName);
+    const outputPath = path.join(outputDir, audioFileName);
 
-    await generateSpeech(translatedText, audioPath, (progress) => {
+    await generateSpeech(translatedText, outputPath, (progress) => {
       sendSSE(res, { step: 'tts_progress', data: { progress } });
     });
 
@@ -99,6 +113,9 @@ app.post('/api/process', async (req, res) => {
   } catch (error: any) {
     console.error('[Process] Error:', error.message);
     sendSSE(res, { step: 'error', message: error.message || 'Erreur inattendue lors du traitement' });
+
+    // Clean up on error
+    if (audioPath) cleanupAudioFile(audioPath);
   }
 
   res.end();
@@ -117,5 +134,5 @@ const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => {
   console.log(`Server running on http://localhost:${PORT}`);
   console.log(`OpenAI API key: ${process.env.OPENAI_API_KEY ? 'configured' : 'MISSING'}`);
-  console.log(`Groq API key: ${process.env.GROQ_API_KEY ? 'configured (will use for translation)' : 'not set (using OpenAI for translation)'}`);
+  console.log(`Groq API key: ${process.env.GROQ_API_KEY ? 'configured (Whisper + translation)' : 'not set (using OpenAI for Whisper + translation)'}`);
 });

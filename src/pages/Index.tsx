@@ -70,7 +70,8 @@ const Index = () => {
     setErrorMessage("");
     setVideoId("");
     setSteps([
-      { id: "transcript", label: "Récupération de la transcription", status: "pending" },
+      { id: "download", label: "Extraction audio YouTube", status: "pending" },
+      { id: "transcript", label: "Transcription Whisper IA", status: "pending" },
       { id: "translating", label: "Traduction", status: "pending" },
       { id: "tts", label: "Génération de l'audio", status: "pending" },
     ]);
@@ -146,6 +147,22 @@ const Index = () => {
 
   const handleSSEEvent = (data: any) => {
     switch (data.step) {
+      case "download":
+        setSteps((prev) =>
+          prev.map((s) =>
+            s.id === "download" ? { ...s, status: "active" } : s
+          )
+        );
+        break;
+
+      case "download_done":
+        setSteps((prev) =>
+          prev.map((s) =>
+            s.id === "download" ? { ...s, status: "done" } : s
+          )
+        );
+        break;
+
       case "transcript":
         setSteps((prev) =>
           prev.map((s) =>

@@ -1,11 +1,10 @@
-import { getSubtitles } from 'youtube-captions-scraper';
-import { YoutubeTranscript } from 'youtube-transcript';
+import { execFile } from 'child_process';
+import { promisify } from 'util';
+import path from 'path';
+import fs from 'fs';
+import os from 'os';
 
-export interface TranscriptSegment {
-  text: string;
-  offset: number;
-  duration: number;
-}
+const execFileAsync = promisify(execFile);
 
 export function extractVideoId(url: string): string | null {
   const match = url.match(
@@ -14,82 +13,60 @@ export function extractVideoId(url: string): string | null {
   return match ? match[1] : null;
 }
 
-function decodeHtmlEntities(text: string): string {
-  return text
-    .replace(/&amp;/g, '&')
-    .replace(/&lt;/g, '<')
-    .replace(/&gt;/g, '>')
-    .replace(/&quot;/g, '"')
-    .replace(/&#39;/g, "'")
-    .replace(/&#x27;/g, "'")
-    .replace(/&#x2F;/g, '/')
-    .replace(/\n/g, ' ')
-    .trim();
-}
+/**
+ * Download audio from a YouTube video using yt-dlp.
+ * Returns the path to the downloaded MP3 file.
+ */
+export async function downloadYouTubeAudio(videoId: string): Promise<string> {
+  const tmpDir = path.join(os.tmpdir(), 'harmony-voice');
+  if (!fs.existsSync(tmpDir)) fs.mkdirSync(tmpDir, { recursive: true });
 
-// Method 1: youtube-captions-scraper (more reliable)
-async function fetchWithCaptionsScraper(videoId: string): Promise<TranscriptSegment[]> {
-  // Try multiple language codes in order of preference
-  const langCodes = ['en', 'fr', 'es', 'de', 'pt', 'it', 'auto'];
+  const outputTemplate = path.join(tmpDir, `${videoId}.%(ext)s`);
+  const expectedOutput = path.join(tmpDir, `${videoId}.mp3`);
 
-  for (const lang of langCodes) {
-    try {
-      const captions = await getSubtitles({ videoID: videoId, lang });
-      if (captions && captions.length > 0) {
-        return captions.map((item: any) => ({
-          text: decodeHtmlEntities(item.text || ''),
-          offset: parseFloat(item.start || '0') * 1000,
-          duration: parseFloat(item.dur || '0') * 1000,
-        }));
-      }
-    } catch {
-      // Try next language
-      continue;
+  // Clean up previous download if exists
+  if (fs.existsSync(expectedOutput)) fs.unlinkSync(expectedOutput);
+
+  const url = `https://www.youtube.com/watch?v=${videoId}`;
+
+  try {
+    await execFileAsync('yt-dlp', [
+      '-x',                          // Extract audio only
+      '--audio-format', 'mp3',       // Convert to mp3
+      '--audio-quality', '64K',      // Low bitrate (sufficient for speech)
+      '--no-playlist',               // Don't download playlists
+      '--no-warnings',               // Suppress warnings
+      '--postprocessor-args', '-ar 16000 -ac 1',  // 16kHz mono (optimal for Whisper)
+      '-o', outputTemplate,
+      url,
+    ], { timeout: 120000 }); // 2 min timeout
+  } catch (err: any) {
+    if (err.code === 'ENOENT') {
+      throw new Error(
+        'yt-dlp non trouvé. Installez-le: pip install yt-dlp (ou winget install yt-dlp sur Windows)'
+      );
     }
+    throw new Error(`Erreur lors du téléchargement audio: ${err.message}`);
   }
 
-  throw new Error('captions-scraper: no subtitles found');
+  // Verify file exists
+  if (!fs.existsSync(expectedOutput)) {
+    throw new Error("Échec de l'extraction audio. Vérifiez que ffmpeg est installé.");
+  }
+
+  const stats = fs.statSync(expectedOutput);
+  console.log(`[YouTube] Audio downloaded: ${(stats.size / 1024 / 1024).toFixed(1)}MB → ${expectedOutput}`);
+
+  return expectedOutput;
 }
 
-// Method 2: youtube-transcript (fallback)
-async function fetchWithYoutubeTranscript(videoId: string): Promise<TranscriptSegment[]> {
-  const transcript = await YoutubeTranscript.fetchTranscript(videoId);
-
-  if (!transcript || transcript.length === 0) {
-    throw new Error('youtube-transcript: empty result');
-  }
-
-  return transcript.map(item => ({
-    text: decodeHtmlEntities(item.text),
-    offset: item.offset,
-    duration: item.duration,
-  }));
-}
-
-export async function fetchYouTubeTranscript(videoId: string): Promise<TranscriptSegment[]> {
-  const errors: string[] = [];
-
-  // Try method 1: youtube-captions-scraper
+/**
+ * Clean up a downloaded audio file.
+ */
+export function cleanupAudioFile(audioPath: string) {
   try {
-    const result = await fetchWithCaptionsScraper(videoId);
-    console.log(`[YouTube] Transcript fetched via captions-scraper: ${result.length} segments`);
-    return result;
-  } catch (err: any) {
-    errors.push(`captions-scraper: ${err.message}`);
-    console.log(`[YouTube] captions-scraper failed: ${err.message}`);
+    if (fs.existsSync(audioPath)) fs.unlinkSync(audioPath);
+  } catch {
+    // Ignore cleanup errors
   }
-
-  // Try method 2: youtube-transcript
-  try {
-    const result = await fetchWithYoutubeTranscript(videoId);
-    console.log(`[YouTube] Transcript fetched via youtube-transcript: ${result.length} segments`);
-    return result;
-  } catch (err: any) {
-    errors.push(`youtube-transcript: ${err.message}`);
-    console.log(`[YouTube] youtube-transcript failed: ${err.message}`);
-  }
-
-  throw new Error(
-    `Aucun sous-titre disponible pour cette vidéo. Assurez-vous que la vidéo possède des sous-titres activés. Détails: ${errors.join(' | ')}`
-  );
 }
