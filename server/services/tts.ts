@@ -3,7 +3,7 @@ import fs from 'fs';
 
 const MAX_TTS_CHARS = 4096;
 
-function splitForTTS(text: string): string[] {
+export function splitForTTS(text: string): string[] {
   if (text.length <= MAX_TTS_CHARS) return [text];
 
   const sentences = text.split(/(?<=[.!?])\s+/);
@@ -36,31 +36,33 @@ function splitForTTS(text: string): string[] {
   return result;
 }
 
+export async function generateSpeechChunk(text: string): Promise<Buffer> {
+  const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+  const response = await openai.audio.speech.create({
+    model: 'tts-1',
+    voice: 'nova',
+    input: text,
+    response_format: 'mp3',
+  });
+  return Buffer.from(await response.arrayBuffer());
+}
+
 export async function generateSpeech(
   text: string,
   outputPath: string,
   onProgress?: (progress: number) => void
 ): Promise<void> {
-  const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
   const chunks = splitForTTS(text);
   const audioBuffers: Buffer[] = [];
 
   console.log(`[TTS] Generating audio for ${chunks.length} chunks (${text.length} chars total)`);
 
   for (let i = 0; i < chunks.length; i++) {
-    const response = await openai.audio.speech.create({
-      model: 'tts-1',
-      voice: 'nova',
-      input: chunks[i],
-      response_format: 'mp3',
-    });
-
-    const buffer = Buffer.from(await response.arrayBuffer());
+    const buffer = await generateSpeechChunk(chunks[i]);
     audioBuffers.push(buffer);
     onProgress?.(Math.round(((i + 1) / chunks.length) * 100));
   }
 
-  // Concatenate MP3 buffers (MP3 frame concatenation works correctly)
   const finalBuffer = Buffer.concat(audioBuffers);
   fs.writeFileSync(outputPath, finalBuffer);
 

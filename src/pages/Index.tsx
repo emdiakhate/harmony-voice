@@ -13,6 +13,7 @@ import {
   Loader2,
   AlertCircle,
   XCircle,
+  Download,
 } from "lucide-react";
 import FileDropZone from "@/components/FileDropZone";
 import LanguageSelector from "@/components/LanguageSelector";
@@ -47,10 +48,15 @@ const Index = () => {
   const [translation, setTranslation] = useState("");
   const [isProcessing, setIsProcessing] = useState(false);
   const [audioUrl, setAudioUrl] = useState("");
+  const [audioChunks, setAudioChunks] = useState<string[]>([]);
+  const [isTtsStreaming, setIsTtsStreaming] = useState(false);
   const [videoId, setVideoId] = useState("");
   const [steps, setSteps] = useState<ProcessingStep[]>([]);
   const [errorMessage, setErrorMessage] = useState("");
   const abortRef = useRef<AbortController | null>(null);
+
+  // Video download state
+  const [isDownloadingVideo, setIsDownloadingVideo] = useState(false);
 
   const handleProcess = async () => {
     if (inputMode === "url" && !youtubeUrl) {
@@ -67,6 +73,8 @@ const Index = () => {
     setTranscription("");
     setTranslation("");
     setAudioUrl("");
+    setAudioChunks([]);
+    setIsTtsStreaming(false);
     setErrorMessage("");
     setVideoId("");
     setSteps([
@@ -142,6 +150,7 @@ const Index = () => {
       }
     } finally {
       setIsProcessing(false);
+      setIsTtsStreaming(false);
     }
   };
 
@@ -208,9 +217,15 @@ const Index = () => {
         break;
 
       case "tts":
+        setIsTtsStreaming(true);
         setSteps((prev) =>
           prev.map((s) => (s.id === "tts" ? { ...s, status: "active" } : s))
         );
+        break;
+
+      case "audio_chunk":
+        // Append new chunk URL for streaming playback
+        setAudioChunks((prev) => [...prev, data.data.audioUrl]);
         break;
 
       case "tts_progress":
@@ -223,6 +238,7 @@ const Index = () => {
 
       case "done":
         setAudioUrl(data.data.audioUrl);
+        setIsTtsStreaming(false);
         if (data.data.videoId) setVideoId(data.data.videoId);
         if (data.data.translatedText) setTranslation(data.data.translatedText);
         if (data.data.transcript) setTranscription(data.data.transcript);
@@ -232,6 +248,7 @@ const Index = () => {
 
       case "error":
         setErrorMessage(data.message);
+        setIsTtsStreaming(false);
         setSteps((prev) =>
           prev.map((s) =>
             s.status === "active" ? { ...s, status: "error" } : s
@@ -246,13 +263,49 @@ const Index = () => {
   const handleCancel = () => {
     abortRef.current?.abort();
     setIsProcessing(false);
+    setIsTtsStreaming(false);
     setSteps([]);
     toast.info("Traitement annulé");
+  };
+
+  const handleDownloadVideo = async () => {
+    if (!videoId || !audioUrl) return;
+
+    setIsDownloadingVideo(true);
+    toast.info("Téléchargement et fusion de la vidéo en cours...");
+
+    try {
+      const response = await fetch("/api/merge-video", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ videoId, audioUrl }),
+      });
+
+      const result = await response.json();
+
+      if (!response.ok) {
+        throw new Error(result.error || "Erreur lors de la fusion vidéo");
+      }
+
+      // Trigger download
+      const a = document.createElement("a");
+      a.href = result.videoUrl;
+      a.download = `${videoId}_traduit.mp4`;
+      a.click();
+
+      toast.success(`Vidéo traduite prête (${result.fileSize})`);
+    } catch (error: any) {
+      toast.error(error.message || "Erreur lors du téléchargement vidéo");
+    } finally {
+      setIsDownloadingVideo(false);
+    }
   };
 
   const previewVideoId =
     inputMode === "url" && youtubeUrl ? extractVideoId(youtubeUrl) : null;
   const displayVideoId = videoId || previewVideoId;
+
+  const showAudioPlayer = audioChunks.length > 0 || audioUrl;
 
   return (
     <div className="min-h-screen bg-background">
@@ -467,11 +520,38 @@ const Index = () => {
               className="space-y-4"
             >
               <YouTubePlayer videoId={displayVideoId} />
-              {audioUrl && (
+              {showAudioPlayer && (
                 <AudioPlayer
-                  audioUrl={audioUrl}
+                  audioChunks={audioChunks}
+                  audioUrl={audioUrl || undefined}
+                  isStreaming={isTtsStreaming}
                   title="Audio traduit en français"
                 />
+              )}
+              {/* Download translated video button */}
+              {audioUrl && videoId && (
+                <motion.div
+                  initial={{ opacity: 0, y: 10 }}
+                  animate={{ opacity: 1, y: 0 }}
+                >
+                  <button
+                    onClick={handleDownloadVideo}
+                    disabled={isDownloadingVideo}
+                    className="w-full py-3 rounded-xl bg-muted border border-border text-foreground font-medium text-sm hover:bg-muted/80 transition-all flex items-center justify-center gap-2 disabled:opacity-50"
+                  >
+                    {isDownloadingVideo ? (
+                      <>
+                        <Loader2 className="w-4 h-4 animate-spin" />
+                        Fusion vidéo + audio traduit en cours...
+                      </>
+                    ) : (
+                      <>
+                        <Download className="w-4 h-4" />
+                        Télécharger la vidéo traduite (.mp4)
+                      </>
+                    )}
+                  </button>
+                </motion.div>
               )}
             </motion.section>
           )}

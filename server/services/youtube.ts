@@ -103,11 +103,77 @@ export async function downloadYouTubeAudio(videoId: string): Promise<string> {
 }
 
 /**
- * Clean up a downloaded audio file.
+ * Download the full video (with original audio) from YouTube.
+ * Returns the path to the downloaded video file.
  */
-export function cleanupAudioFile(audioPath: string) {
+export async function downloadYouTubeVideo(videoId: string): Promise<string> {
+  const tmpDir = path.join(os.tmpdir(), 'harmony-voice');
+  if (!fs.existsSync(tmpDir)) fs.mkdirSync(tmpDir, { recursive: true });
+
+  const outputTemplate = path.join(tmpDir, `${videoId}_video.%(ext)s`);
+  const expectedOutput = path.join(tmpDir, `${videoId}_video.mp4`);
+
+  if (fs.existsSync(expectedOutput)) fs.unlinkSync(expectedOutput);
+
+  const url = `https://www.youtube.com/watch?v=${videoId}`;
+  const { command, useShell } = await findYtDlp();
+
+  const args = [
+    '-f', 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
+    '--merge-output-format', 'mp4',
+    '--no-playlist',
+    '--no-warnings',
+    '-o', outputTemplate,
+    url,
+  ];
+
   try {
-    if (fs.existsSync(audioPath)) fs.unlinkSync(audioPath);
+    if (useShell) {
+      const escapedArgs = args.map(a => `"${a}"`).join(' ');
+      await execAsync(`${command} ${escapedArgs}`, { timeout: 300000 });
+    } else {
+      await execFileAsync(command, args, { timeout: 300000 });
+    }
+  } catch (err: any) {
+    throw new Error(`Erreur téléchargement vidéo: ${err.stderr || err.message}`);
+  }
+
+  if (!fs.existsSync(expectedOutput)) {
+    throw new Error("Échec du téléchargement vidéo.");
+  }
+
+  const stats = fs.statSync(expectedOutput);
+  console.log(`[YouTube] Video downloaded: ${(stats.size / 1024 / 1024).toFixed(1)}MB → ${expectedOutput}`);
+
+  return expectedOutput;
+}
+
+/**
+ * Merge a video file with a translated audio track using ffmpeg.
+ */
+export async function mergeVideoAudio(videoPath: string, audioPath: string, outputPath: string): Promise<void> {
+  try {
+    await execAsync(
+      `ffmpeg -i "${videoPath}" -i "${audioPath}" -c:v copy -map 0:v:0 -map 1:a:0 -shortest -y "${outputPath}"`,
+      { timeout: 300000 }
+    );
+  } catch (err: any) {
+    throw new Error(`Erreur fusion vidéo/audio: ${err.stderr || err.message}`);
+  }
+
+  if (!fs.existsSync(outputPath)) {
+    throw new Error("Échec de la fusion vidéo/audio.");
+  }
+
+  console.log(`[Merge] Video merged: ${outputPath}`);
+}
+
+/**
+ * Clean up a temporary file.
+ */
+export function cleanupAudioFile(filePath: string) {
+  try {
+    if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
   } catch {
     // Ignore cleanup errors
   }

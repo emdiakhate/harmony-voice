@@ -4,10 +4,10 @@ import { config } from 'dotenv';
 import { fileURLToPath } from 'url';
 import path from 'path';
 import fs from 'fs';
-import { downloadYouTubeAudio, extractVideoId, cleanupAudioFile } from './services/youtube.js';
+import { downloadYouTubeAudio, downloadYouTubeVideo, mergeVideoAudio, extractVideoId, cleanupAudioFile } from './services/youtube.js';
 import { transcribeAudio } from './services/transcriber.js';
 import { translateText } from './services/translator.js';
-import { generateSpeech } from './services/tts.js';
+import { splitForTTS, generateSpeechChunk } from './services/tts.js';
 
 config();
 
@@ -22,12 +22,17 @@ const outputDir = path.join(__dirname, 'output');
 if (!fs.existsSync(outputDir)) fs.mkdirSync(outputDir, { recursive: true });
 app.use('/api/audio', express.static(outputDir));
 
+// Serve generated video files
+const videoOutputDir = path.join(__dirname, 'output', 'videos');
+if (!fs.existsSync(videoOutputDir)) fs.mkdirSync(videoOutputDir, { recursive: true });
+app.use('/api/video', express.static(videoOutputDir));
+
 // SSE helper
 function sendSSE(res: express.Response, data: any) {
   res.write(`data: ${JSON.stringify(data)}\n\n`);
 }
 
-// Main processing endpoint (SSE stream)
+// Main processing endpoint (SSE stream with streaming TTS)
 app.post('/api/process', async (req, res) => {
   const { url, targetLanguage = 'fr' } = req.body;
 
@@ -74,7 +79,7 @@ app.post('/api/process', async (req, res) => {
       data: { transcript: fullTranscript, segmentCount: segments.length }
     });
 
-    // Clean up audio file (no longer needed)
+    // Clean up source audio file (no longer needed)
     cleanupAudioFile(audioPath);
     audioPath = null;
 
@@ -89,21 +94,51 @@ app.post('/api/process', async (req, res) => {
 
     sendSSE(res, { step: 'translation_done', data: { translatedText } });
 
-    // Step 4: Generate TTS audio
+    // Step 4: Streaming TTS - send each chunk as it's generated
     sendSSE(res, { step: 'tts', message: "Génération de l'audio traduit..." });
 
-    const audioFileName = `${videoId}_${targetLanguage}_${Date.now()}.mp3`;
-    const outputPath = path.join(outputDir, audioFileName);
+    const ttsChunks = splitForTTS(translatedText);
+    const audioBuffers: Buffer[] = [];
+    const timestamp = Date.now();
 
-    await generateSpeech(translatedText, outputPath, (progress) => {
-      sendSSE(res, { step: 'tts_progress', data: { progress } });
-    });
+    console.log(`[Process] TTS streaming: ${ttsChunks.length} chunks to generate`);
+
+    for (let i = 0; i < ttsChunks.length; i++) {
+      const buffer = await generateSpeechChunk(ttsChunks[i]);
+      audioBuffers.push(buffer);
+
+      // Save individual chunk for streaming playback
+      const chunkFileName = `${videoId}_${targetLanguage}_${timestamp}_chunk${i}.mp3`;
+      fs.writeFileSync(path.join(outputDir, chunkFileName), buffer);
+
+      // Stream chunk URL to client immediately
+      sendSSE(res, {
+        step: 'audio_chunk',
+        data: {
+          index: i,
+          total: ttsChunks.length,
+          audioUrl: `/api/audio/${chunkFileName}`,
+        }
+      });
+
+      sendSSE(res, {
+        step: 'tts_progress',
+        data: { progress: Math.round(((i + 1) / ttsChunks.length) * 100) }
+      });
+    }
+
+    // Save final concatenated file
+    const finalFileName = `${videoId}_${targetLanguage}_${timestamp}.mp3`;
+    const finalPath = path.join(outputDir, finalFileName);
+    fs.writeFileSync(finalPath, Buffer.concat(audioBuffers));
+
+    console.log(`[Process] Final audio saved: ${finalFileName}`);
 
     // Done!
     sendSSE(res, {
       step: 'done',
       data: {
-        audioUrl: `/api/audio/${audioFileName}`,
+        audioUrl: `/api/audio/${finalFileName}`,
         translatedText,
         transcript: fullTranscript,
         videoId,
@@ -119,6 +154,54 @@ app.post('/api/process', async (req, res) => {
   }
 
   res.end();
+});
+
+// Merge translated audio into video for download
+app.post('/api/merge-video', async (req, res) => {
+  const { videoId, audioUrl } = req.body;
+
+  if (!videoId || !audioUrl) {
+    return res.status(400).json({ error: 'videoId et audioUrl requis' });
+  }
+
+  // Resolve the audio file path from the URL
+  const audioFileName = path.basename(audioUrl);
+  const audioPath = path.join(outputDir, audioFileName);
+
+  if (!fs.existsSync(audioPath)) {
+    return res.status(404).json({ error: 'Fichier audio non trouvé' });
+  }
+
+  let videoPath: string | null = null;
+
+  try {
+    console.log(`[Merge] Downloading video for ${videoId}...`);
+
+    // Download original video
+    videoPath = await downloadYouTubeVideo(videoId);
+
+    // Merge video + translated audio
+    const mergedFileName = `${videoId}_translated_${Date.now()}.mp4`;
+    const mergedPath = path.join(videoOutputDir, mergedFileName);
+
+    console.log(`[Merge] Merging video + translated audio...`);
+    await mergeVideoAudio(videoPath, audioPath, mergedPath);
+
+    // Clean up temp video
+    cleanupAudioFile(videoPath);
+
+    const stats = fs.statSync(mergedPath);
+    console.log(`[Merge] Done: ${mergedFileName} (${(stats.size / 1024 / 1024).toFixed(1)}MB)`);
+
+    res.json({
+      videoUrl: `/api/video/${mergedFileName}`,
+      fileSize: `${(stats.size / 1024 / 1024).toFixed(1)}MB`,
+    });
+  } catch (error: any) {
+    console.error('[Merge] Error:', error.message);
+    if (videoPath) cleanupAudioFile(videoPath);
+    res.status(500).json({ error: error.message });
+  }
 });
 
 // Health check
