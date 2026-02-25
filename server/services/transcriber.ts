@@ -28,6 +28,11 @@ export interface TranscriptionResult {
 export async function transcribeAudio(audioPath: string): Promise<TranscriptionResult> {
   const useGroq = !!process.env.GROQ_API_KEY;
 
+  // OpenRouter ne supporte pas Whisper, on utilise Groq ou OpenAI
+  if (!useGroq && !process.env.OPENAI_API_KEY) {
+    throw new Error('GROQ_API_KEY ou OPENAI_API_KEY requis pour la transcription Whisper (OpenRouter ne supporte pas Whisper)');
+  }
+
   console.log(`[Transcriber] Using ${useGroq ? 'Groq Whisper (whisper-large-v3-turbo)' : 'OpenAI Whisper (whisper-1)'}`);
 
   const stats = fs.statSync(audioPath);

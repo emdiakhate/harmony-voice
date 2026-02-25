@@ -53,7 +53,10 @@ export async function generatePodcastAudio(
     console.log('[PodcastTTS] No GOOGLE_API_KEY set, using OpenAI TTS directly');
   }
 
-  // Fallback: OpenAI TTS with alternating voices
+  // Fallback: OpenAI TTS with alternating voices (OpenRouter ne supporte pas TTS)
+  if (!process.env.OPENAI_API_KEY) {
+    throw new Error('Podcast TTS nécessite GOOGLE_API_KEY (Gemini) ou OPENAI_API_KEY. OpenRouter ne supporte pas le TTS audio.');
+  }
   const audioBuffer = await generateWithOpenAI(script, onProgress);
   console.log(`[PodcastTTS] OpenAI fallback success: ${(audioBuffer.length / 1024 / 1024).toFixed(2)}MB`);
   return { audioBuffer, provider: 'openai' };

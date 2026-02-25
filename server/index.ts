@@ -137,8 +137,8 @@ app.post('/api/process', async (req, res) => {
       return res.end();
     }
 
-    if (!process.env.OPENAI_API_KEY && !process.env.GROQ_API_KEY) {
-      sendSSE(res, { step: 'error', message: 'Aucune clé API configurée. Ajoutez GROQ_API_KEY ou OPENAI_API_KEY dans .env' });
+    if (!process.env.OPENAI_API_KEY && !process.env.GROQ_API_KEY && !process.env.OPENROUTER_API_KEY) {
+      sendSSE(res, { step: 'error', message: 'Aucune clé API configurée. Ajoutez GROQ_API_KEY, OPENROUTER_API_KEY ou OPENAI_API_KEY dans .env' });
       return res.end();
     }
 
@@ -205,8 +205,8 @@ app.post('/api/process-file', upload.single('file'), async (req, res) => {
     return res.end();
   }
 
-  if (!process.env.OPENAI_API_KEY && !process.env.GROQ_API_KEY) {
-    sendSSE(res, { step: 'error', message: 'Aucune clé API configurée. Ajoutez GROQ_API_KEY ou OPENAI_API_KEY dans .env' });
+  if (!process.env.OPENAI_API_KEY && !process.env.GROQ_API_KEY && !process.env.OPENROUTER_API_KEY) {
+    sendSSE(res, { step: 'error', message: 'Aucune clé API configurée. Ajoutez GROQ_API_KEY, OPENROUTER_API_KEY ou OPENAI_API_KEY dans .env' });
     cleanupAudioFile(file.path);
     return res.end();
   }
@@ -310,13 +310,18 @@ app.get('/api/health', (_req, res) => {
     openai: !!process.env.OPENAI_API_KEY,
     groq: !!process.env.GROQ_API_KEY,
     google: !!process.env.GOOGLE_API_KEY,
+    openrouter: !!process.env.OPENROUTER_API_KEY,
   });
 });
 
 const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => {
   console.log(`Server running on http://localhost:${PORT}`);
-  console.log(`OpenAI API key: ${process.env.OPENAI_API_KEY ? 'configured' : 'MISSING'}`);
-  console.log(`Groq API key: ${process.env.GROQ_API_KEY ? 'configured (Whisper + translation)' : 'not set (using OpenAI)'}`);
-  console.log(`Google API key: ${process.env.GOOGLE_API_KEY ? 'configured (Gemini TTS podcast)' : 'not set (OpenAI TTS fallback for podcast)'}`);
+  console.log(`OpenAI API key: ${process.env.OPENAI_API_KEY ? 'configured' : 'not set'}`);
+  console.log(`Groq API key: ${process.env.GROQ_API_KEY ? 'configured (Whisper + translation)' : 'not set'}`);
+  console.log(`OpenRouter API key: ${process.env.OPENROUTER_API_KEY ? 'configured (LLM fallback)' : 'not set'}`);
+  console.log(`Google API key: ${process.env.GOOGLE_API_KEY ? 'configured (Gemini TTS podcast)' : 'not set'}`);
+  console.log(`[Priority] Translation/LLM: Groq > OpenRouter > OpenAI`);
+  console.log(`[Priority] TTS: OpenAI (requis) | Podcast TTS: Gemini > OpenAI`);
+  console.log(`[Priority] Whisper: Groq > OpenAI`);
 });

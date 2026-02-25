@@ -28,13 +28,25 @@ IMPORTANT: Keep it concise but engaging (~2000-4000 words).
 
 `;
 
+const SYSTEM_MSG = 'You are a professional podcast script writer. You write engaging, natural-sounding podcast scripts in French.';
+
+/**
+ * Determine which LLM provider to use.
+ * Priority: Groq > OpenRouter > OpenAI
+ */
+function getProvider(): 'groq' | 'openrouter' | 'openai' {
+  if (process.env.GROQ_API_KEY) return 'groq';
+  if (process.env.OPENROUTER_API_KEY) return 'openrouter';
+  return 'openai';
+}
+
 /**
  * Generate a podcast-style script from text content using LLM.
  */
 export async function generatePodcastScript(text: string): Promise<string> {
-  const useGroq = !!process.env.GROQ_API_KEY;
+  const provider = getProvider();
 
-  console.log(`[Podcast] Generating script with ${useGroq ? 'Groq' : 'OpenAI'} (${text.length} chars input)`);
+  console.log(`[Podcast] Generating script with ${provider} (${text.length} chars input)`);
 
   // Truncate input if too long (LLM context limits)
   const maxInputChars = 15000;
@@ -44,9 +56,15 @@ export async function generatePodcastScript(text: string): Promise<string> {
 
   const prompt = PODCAST_PROMPT + inputText;
 
-  const script = useGroq
-    ? await generateWithGroq(prompt)
-    : await generateWithOpenAI(prompt);
+  let script: string;
+
+  if (provider === 'groq') {
+    script = await generateWithGroq(prompt);
+  } else if (provider === 'openrouter') {
+    script = await generateWithOpenRouter(prompt);
+  } else {
+    script = await generateWithOpenAI(prompt);
+  }
 
   console.log(`[Podcast] Script generated: ${script.length} chars`);
 
@@ -59,10 +77,26 @@ async function generateWithGroq(prompt: string): Promise<string> {
   const response = await groq.chat.completions.create({
     model: 'llama-3.3-70b-versatile',
     messages: [
-      {
-        role: 'system',
-        content: 'You are a professional podcast script writer. You write engaging, natural-sounding podcast scripts in French.',
-      },
+      { role: 'system', content: SYSTEM_MSG },
+      { role: 'user', content: prompt },
+    ],
+    temperature: 0.7,
+    max_tokens: 8000,
+  });
+
+  return response.choices[0].message.content || '';
+}
+
+async function generateWithOpenRouter(prompt: string): Promise<string> {
+  const openrouter = new OpenAI({
+    apiKey: process.env.OPENROUTER_API_KEY,
+    baseURL: 'https://openrouter.ai/api/v1',
+  });
+
+  const response = await openrouter.chat.completions.create({
+    model: 'meta-llama/llama-3.3-70b-instruct',
+    messages: [
+      { role: 'system', content: SYSTEM_MSG },
       { role: 'user', content: prompt },
     ],
     temperature: 0.7,
@@ -78,10 +112,7 @@ async function generateWithOpenAI(prompt: string): Promise<string> {
   const response = await openai.chat.completions.create({
     model: 'gpt-4o-mini',
     messages: [
-      {
-        role: 'system',
-        content: 'You are a professional podcast script writer. You write engaging, natural-sounding podcast scripts in French.',
-      },
+      { role: 'system', content: SYSTEM_MSG },
       { role: 'user', content: prompt },
     ],
     temperature: 0.7,

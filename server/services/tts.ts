@@ -37,6 +37,10 @@ export function splitForTTS(text: string): string[] {
 }
 
 export async function generateSpeechChunk(text: string): Promise<Buffer> {
+  // OpenRouter ne supporte pas le TTS audio, on utilise OpenAI directement
+  if (!process.env.OPENAI_API_KEY) {
+    throw new Error('OPENAI_API_KEY requis pour la génération TTS (OpenRouter ne supporte pas le TTS audio)');
+  }
   const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
   const response = await openai.audio.speech.create({
     model: 'tts-1',
