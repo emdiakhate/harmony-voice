@@ -322,6 +322,6 @@ app.listen(PORT, () => {
   console.log(`OpenRouter API key: ${process.env.OPENROUTER_API_KEY ? 'configured (LLM fallback)' : 'not set'}`);
   console.log(`Google API key: ${process.env.GOOGLE_API_KEY ? 'configured (Gemini TTS podcast)' : 'not set'}`);
   console.log(`[Priority] Translation/LLM: Groq > OpenRouter > OpenAI`);
-  console.log(`[Priority] TTS: OpenAI (requis) | Podcast TTS: Gemini > OpenAI`);
+  console.log(`[Priority] TTS: OpenAI > OpenRouter | Podcast TTS: Gemini > OpenAI`);
   console.log(`[Priority] Whisper: Groq > OpenAI`);
 });

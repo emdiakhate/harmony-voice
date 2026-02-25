@@ -36,19 +36,48 @@ export function splitForTTS(text: string): string[] {
   return result;
 }
 
+/**
+ * TTS provider priority: OpenAI > OpenRouter
+ * Falls back to OpenRouter if OpenAI key is missing or quota is exhausted (429).
+ */
 export async function generateSpeechChunk(text: string): Promise<Buffer> {
-  // OpenRouter ne supporte pas le TTS audio, on utilise OpenAI directement
-  if (!process.env.OPENAI_API_KEY) {
-    throw new Error('OPENAI_API_KEY requis pour la génération TTS (OpenRouter ne supporte pas le TTS audio)');
+  // Try OpenAI first
+  if (process.env.OPENAI_API_KEY) {
+    try {
+      const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+      const response = await openai.audio.speech.create({
+        model: 'tts-1',
+        voice: 'nova',
+        input: text,
+        response_format: 'mp3',
+      });
+      return Buffer.from(await response.arrayBuffer());
+    } catch (err: any) {
+      if (err?.status === 429 || err?.code === 'insufficient_quota') {
+        console.warn('[TTS] OpenAI quota exceeded, falling back to OpenRouter...');
+      } else {
+        throw err;
+      }
+    }
   }
-  const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
-  const response = await openai.audio.speech.create({
-    model: 'tts-1',
-    voice: 'nova',
-    input: text,
-    response_format: 'mp3',
-  });
-  return Buffer.from(await response.arrayBuffer());
+
+  // Fallback: OpenRouter with openai/tts-1
+  if (process.env.OPENROUTER_API_KEY) {
+    console.log('[TTS] Using OpenRouter (openai/tts-1)');
+    const openrouter = new OpenAI({
+      apiKey: process.env.OPENROUTER_API_KEY,
+      baseURL: 'https://openrouter.ai/api/v1',
+    });
+    const response = await openrouter.audio.speech.create({
+      model: 'openai/tts-1',
+      voice: 'nova',
+      input: text,
+      response_format: 'mp3',
+    });
+    return Buffer.from(await response.arrayBuffer());
+  }
+
+  throw new Error('Aucun provider TTS disponible. Configurez OPENAI_API_KEY ou OPENROUTER_API_KEY dans .env');
 }
 
 export async function generateSpeech(
