@@ -15,6 +15,7 @@ import {
   XCircle,
   Download,
   Music,
+  Radio,
 } from "lucide-react";
 import FileDropZone from "@/components/FileDropZone";
 import LanguageSelector from "@/components/LanguageSelector";
@@ -92,6 +93,10 @@ const Index = () => {
   const [errorMessage, setErrorMessage] = useState("");
   const abortRef = useRef<AbortController | null>(null);
 
+  // Podcast mode
+  const [podcastMode, setPodcastMode] = useState(false);
+  const [podcastScript, setPodcastScript] = useState("");
+
   // Video download state
   const [isDownloadingVideo, setIsDownloadingVideo] = useState(false);
 
@@ -114,21 +119,38 @@ const Index = () => {
     setIsTtsStreaming(false);
     setErrorMessage("");
     setVideoId("");
+    setPodcastScript("");
 
     // Different steps depending on mode
     if (inputMode === "url") {
-      setSteps([
+      const baseSteps: ProcessingStep[] = [
         { id: "download", label: "Extraction audio YouTube", status: "pending" },
         { id: "transcript", label: "Transcription Whisper IA", status: "pending" },
         { id: "translating", label: "Traduction", status: "pending" },
-        { id: "tts", label: "Génération de l'audio", status: "pending" },
-      ]);
+      ];
+      if (podcastMode) {
+        baseSteps.push(
+          { id: "podcast_script", label: "Génération script podcast", status: "pending" },
+          { id: "podcast_tts", label: "Génération audio podcast", status: "pending" },
+        );
+      } else {
+        baseSteps.push({ id: "tts", label: "Génération de l'audio", status: "pending" });
+      }
+      setSteps(baseSteps);
     } else {
-      setSteps([
+      const baseSteps: ProcessingStep[] = [
         { id: "extract", label: "Extraction du texte", status: "pending" },
         { id: "translating", label: "Traduction", status: "pending" },
-        { id: "tts", label: "Génération de l'audio", status: "pending" },
-      ]);
+      ];
+      if (podcastMode) {
+        baseSteps.push(
+          { id: "podcast_script", label: "Génération script podcast", status: "pending" },
+          { id: "podcast_tts", label: "Génération audio podcast", status: "pending" },
+        );
+      } else {
+        baseSteps.push({ id: "tts", label: "Génération de l'audio", status: "pending" });
+      }
+      setSteps(baseSteps);
     }
 
     abortRef.current = new AbortController();
@@ -141,7 +163,7 @@ const Index = () => {
         response = await fetch("/api/process", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ url: youtubeUrl, targetLanguage: targetLang }),
+          body: JSON.stringify({ url: youtubeUrl, targetLanguage: targetLang, podcastMode }),
           signal: abortRef.current.signal,
         });
       } else {
@@ -149,6 +171,7 @@ const Index = () => {
         const formData = new FormData();
         formData.append("file", selectedFile!);
         formData.append("targetLanguage", targetLang);
+        formData.append("podcastMode", String(podcastMode));
 
         response = await fetch("/api/process-file", {
           method: "POST",
@@ -256,6 +279,47 @@ const Index = () => {
           )
         );
         break;
+
+      // Podcast-specific steps
+      case "podcast_script":
+        setSteps((prev) =>
+          prev.map((s) =>
+            s.id === "podcast_script" ? { ...s, status: "active" } : s
+          )
+        );
+        break;
+      case "podcast_script_done":
+        setPodcastScript(data.data.script);
+        setSteps((prev) =>
+          prev.map((s) =>
+            s.id === "podcast_script" ? { ...s, status: "done" } : s
+          )
+        );
+        break;
+      case "podcast_tts":
+        setSteps((prev) =>
+          prev.map((s) =>
+            s.id === "podcast_tts" ? { ...s, status: "active" } : s
+          )
+        );
+        break;
+      case "podcast_tts_progress":
+        setSteps((prev) =>
+          prev.map((s) =>
+            s.id === "podcast_tts"
+              ? { ...s, progress: data.data.progress }
+              : s
+          )
+        );
+        break;
+      case "podcast_tts_done":
+        setSteps((prev) =>
+          prev.map((s) =>
+            s.id === "podcast_tts" ? { ...s, status: "done" } : s
+          )
+        );
+        break;
+
       case "done":
         setAudioUrl(data.data.audioUrl);
         setIsTtsStreaming(false);
@@ -440,6 +504,27 @@ const Index = () => {
             />
           </div>
 
+          {/* Podcast Mode Toggle */}
+          <div className="flex items-center gap-3">
+            <button
+              onClick={() => setPodcastMode(!podcastMode)}
+              disabled={isProcessing}
+              className={`flex items-center gap-2 px-4 py-2.5 rounded-lg text-sm font-medium transition-all ${
+                podcastMode
+                  ? "bg-primary text-primary-foreground"
+                  : "bg-muted text-muted-foreground hover:text-foreground"
+              } disabled:opacity-50`}
+            >
+              <Radio className="w-4 h-4" />
+              Mode Podcast
+            </button>
+            {podcastMode && (
+              <span className="text-xs text-muted-foreground">
+                Le contenu sera transformé en conversation podcast 2 speakers
+              </span>
+            )}
+          </div>
+
           {/* Action Button */}
           {isProcessing ? (
             <button
@@ -610,6 +695,18 @@ const Index = () => {
               content={translation}
               icon={<Languages className="w-5 h-5 text-primary" />}
               isLoading={isProcessing && !translation}
+            />
+          </section>
+        )}
+
+        {/* Podcast Script */}
+        {podcastScript && (
+          <section>
+            <ResultsPanel
+              title="Script Podcast"
+              content={podcastScript}
+              icon={<Radio className="w-5 h-5 text-primary" />}
+              isLoading={false}
             />
           </section>
         )}

@@ -11,6 +11,8 @@ import { transcribeAudio } from './services/transcriber.js';
 import { translateText } from './services/translator.js';
 import { splitForTTS, generateSpeechChunk } from './services/tts.js';
 import { extractTextFromFile } from './services/document-parser.js';
+import { generatePodcastScript } from './services/podcast-generator.js';
+import { generatePodcastAudio } from './services/podcast-tts.js';
 
 config();
 
@@ -86,9 +88,39 @@ async function streamingTTS(
   return `/api/audio/${finalFileName}`;
 }
 
+// Shared: podcast pipeline (generate script → TTS)
+async function podcastPipeline(
+  res: express.Response,
+  translatedText: string,
+  filePrefix: string,
+): Promise<string> {
+  // Step A: Generate podcast script
+  sendSSE(res, { step: 'podcast_script', message: 'Génération du script podcast...' });
+  const podcastScript = await generatePodcastScript(translatedText);
+  console.log(`[Podcast] Script generated: ${podcastScript.length} chars`);
+  sendSSE(res, { step: 'podcast_script_done', data: { script: podcastScript } });
+
+  // Step B: Generate podcast audio (Gemini or OpenAI fallback)
+  sendSSE(res, { step: 'podcast_tts', message: 'Génération audio podcast...' });
+  const { audioBuffer, provider } = await generatePodcastAudio(podcastScript, (progress, message) => {
+    sendSSE(res, { step: 'podcast_tts_progress', data: { progress, message, provider } });
+  });
+
+  console.log(`[Podcast] Audio generated with ${provider}: ${(audioBuffer.length / 1024 / 1024).toFixed(2)}MB`);
+
+  const timestamp = Date.now();
+  const podcastFileName = `${filePrefix}_podcast_${timestamp}.mp3`;
+  const podcastPath = path.join(outputDir, podcastFileName);
+  fs.writeFileSync(podcastPath, audioBuffer);
+
+  sendSSE(res, { step: 'podcast_tts_done', data: { provider } });
+
+  return `/api/audio/${podcastFileName}`;
+}
+
 // ===== YouTube processing (SSE stream) =====
 app.post('/api/process', async (req, res) => {
-  const { url, targetLanguage = 'fr' } = req.body;
+  const { url, targetLanguage = 'fr', podcastMode = false } = req.body;
 
   res.setHeader('Content-Type', 'text/event-stream');
   res.setHeader('Cache-Control', 'no-cache');
@@ -133,12 +165,18 @@ app.post('/api/process', async (req, res) => {
     console.log(`[Process] Translation done: ${translatedText.length} chars`);
     sendSSE(res, { step: 'translation_done', data: { translatedText } });
 
-    // Step 4: Streaming TTS
-    const audioUrl = await streamingTTS(res, translatedText, videoId, targetLanguage);
+    // Step 4: TTS (standard or podcast mode)
+    let audioUrl: string;
+
+    if (podcastMode) {
+      audioUrl = await podcastPipeline(res, translatedText, videoId);
+    } else {
+      audioUrl = await streamingTTS(res, translatedText, videoId, targetLanguage);
+    }
 
     sendSSE(res, {
       step: 'done',
-      data: { audioUrl, translatedText, transcript: fullTranscript, videoId }
+      data: { audioUrl, translatedText, transcript: fullTranscript, videoId, podcastMode }
     });
 
   } catch (error: any) {
@@ -160,6 +198,7 @@ app.post('/api/process-file', upload.single('file'), async (req, res) => {
 
   const file = req.file;
   const targetLanguage = req.body?.targetLanguage || 'fr';
+  const podcastMode = req.body?.podcastMode === 'true';
 
   if (!file) {
     sendSSE(res, { step: 'error', message: 'Aucun fichier reçu.' });
@@ -197,13 +236,19 @@ app.post('/api/process-file', upload.single('file'), async (req, res) => {
     console.log(`[FileProcess] Translation done: ${translatedText.length} chars`);
     sendSSE(res, { step: 'translation_done', data: { translatedText } });
 
-    // Step 3: Streaming TTS
+    // Step 3: TTS (standard or podcast mode)
     const filePrefix = `doc_${Date.now()}`;
-    const audioUrl = await streamingTTS(res, translatedText, filePrefix, targetLanguage);
+    let audioUrl: string;
+
+    if (podcastMode) {
+      audioUrl = await podcastPipeline(res, translatedText, filePrefix);
+    } else {
+      audioUrl = await streamingTTS(res, translatedText, filePrefix, targetLanguage);
+    }
 
     sendSSE(res, {
       step: 'done',
-      data: { audioUrl, translatedText, transcript: originalText }
+      data: { audioUrl, translatedText, transcript: originalText, podcastMode }
     });
 
   } catch (error: any) {
@@ -264,6 +309,7 @@ app.get('/api/health', (_req, res) => {
     status: 'ok',
     openai: !!process.env.OPENAI_API_KEY,
     groq: !!process.env.GROQ_API_KEY,
+    google: !!process.env.GOOGLE_API_KEY,
   });
 });
 
@@ -272,4 +318,5 @@ app.listen(PORT, () => {
   console.log(`Server running on http://localhost:${PORT}`);
   console.log(`OpenAI API key: ${process.env.OPENAI_API_KEY ? 'configured' : 'MISSING'}`);
   console.log(`Groq API key: ${process.env.GROQ_API_KEY ? 'configured (Whisper + translation)' : 'not set (using OpenAI)'}`);
+  console.log(`Google API key: ${process.env.GOOGLE_API_KEY ? 'configured (Gemini TTS podcast)' : 'not set (OpenAI TTS fallback for podcast)'}`);
 });
