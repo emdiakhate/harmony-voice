@@ -1,4 +1,5 @@
 import OpenAI from 'openai';
+import { ElevenLabsClient } from '@elevenlabs/elevenlabs-js';
 import fs from 'fs';
 
 const MAX_TTS_CHARS = 4096;
@@ -37,8 +38,8 @@ export function splitForTTS(text: string): string[] {
 }
 
 /**
- * TTS provider priority: OpenAI > OpenRouter
- * Falls back to OpenRouter if OpenAI key is missing or quota is exhausted (429).
+ * TTS provider priority: OpenAI > ElevenLabs
+ * Falls back to ElevenLabs if OpenAI key is missing or quota is exhausted (429).
  */
 export async function generateSpeechChunk(text: string): Promise<Buffer> {
   // Try OpenAI first
@@ -54,30 +55,34 @@ export async function generateSpeechChunk(text: string): Promise<Buffer> {
       return Buffer.from(await response.arrayBuffer());
     } catch (err: any) {
       if (err?.status === 429 || err?.code === 'insufficient_quota') {
-        console.warn('[TTS] OpenAI quota exceeded, falling back to OpenRouter...');
+        console.warn('[TTS] OpenAI quota exceeded, falling back to ElevenLabs...');
       } else {
         throw err;
       }
     }
   }
 
-  // Fallback: OpenRouter with openai/tts-1
-  if (process.env.OPENROUTER_API_KEY) {
-    console.log('[TTS] Using OpenRouter (openai/tts-1)');
-    const openrouter = new OpenAI({
-      apiKey: process.env.OPENROUTER_API_KEY,
-      baseURL: 'https://openrouter.ai/api/v1',
-    });
-    const response = await openrouter.audio.speech.create({
-      model: 'openai/tts-1',
-      voice: 'nova',
-      input: text,
-      response_format: 'mp3',
-    });
-    return Buffer.from(await response.arrayBuffer());
+  // Fallback: ElevenLabs
+  if (process.env.ELEVENLABS_API_KEY) {
+    console.log('[TTS] Using ElevenLabs (eleven_multilingual_v2)');
+    const elevenlabs = new ElevenLabsClient({ apiKey: process.env.ELEVENLABS_API_KEY });
+    const audio = await elevenlabs.textToSpeech.convert(
+      'EXAVITQu4vr4xnSDxMaL', // "Sarah" - clear female voice, similar to OpenAI nova
+      {
+        text,
+        modelId: 'eleven_multilingual_v2',
+        outputFormat: 'mp3_44100_128',
+      }
+    );
+    // Convert ReadableStream to Buffer
+    const chunks: Uint8Array[] = [];
+    for await (const chunk of audio) {
+      chunks.push(chunk);
+    }
+    return Buffer.concat(chunks);
   }
 
-  throw new Error('Aucun provider TTS disponible. Configurez OPENAI_API_KEY ou OPENROUTER_API_KEY dans .env');
+  throw new Error('Aucun provider TTS disponible. Configurez OPENAI_API_KEY ou ELEVENLABS_API_KEY dans .env');
 }
 
 export async function generateSpeech(

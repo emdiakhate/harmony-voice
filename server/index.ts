@@ -311,6 +311,7 @@ app.get('/api/health', (_req, res) => {
     groq: !!process.env.GROQ_API_KEY,
     google: !!process.env.GOOGLE_API_KEY,
     openrouter: !!process.env.OPENROUTER_API_KEY,
+    elevenlabs: !!process.env.ELEVENLABS_API_KEY,
   });
 });
 
@@ -320,8 +321,9 @@ app.listen(PORT, () => {
   console.log(`OpenAI API key: ${process.env.OPENAI_API_KEY ? 'configured' : 'not set'}`);
   console.log(`Groq API key: ${process.env.GROQ_API_KEY ? 'configured (Whisper + translation)' : 'not set'}`);
   console.log(`OpenRouter API key: ${process.env.OPENROUTER_API_KEY ? 'configured (LLM fallback)' : 'not set'}`);
+  console.log(`ElevenLabs API key: ${process.env.ELEVENLABS_API_KEY ? 'configured (TTS fallback)' : 'not set'}`);
   console.log(`Google API key: ${process.env.GOOGLE_API_KEY ? 'configured (Gemini TTS podcast)' : 'not set'}`);
   console.log(`[Priority] Translation/LLM: Groq > OpenRouter > OpenAI`);
-  console.log(`[Priority] TTS: OpenAI > OpenRouter | Podcast TTS: Gemini > OpenAI`);
+  console.log(`[Priority] TTS: OpenAI > ElevenLabs | Podcast TTS: Gemini > OpenAI`);
   console.log(`[Priority] Whisper: Groq > OpenAI`);
 });
