@@ -29,3 +29,8 @@ server/output/
 *.njsproj
 *.sln
 *.sw?
+
+# Prisma
+/generated/prisma
+*.db
+*.db-journal

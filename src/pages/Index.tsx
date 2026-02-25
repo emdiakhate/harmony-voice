@@ -22,6 +22,7 @@ import LanguageSelector from "@/components/LanguageSelector";
 import ResultsPanel from "@/components/ResultsPanel";
 import YouTubePlayer from "@/components/YouTubePlayer";
 import AudioPlayer from "@/components/AudioPlayer";
+import UserMenu from "@/components/UserMenu";
 import { toast } from "sonner";
 
 type InputMode = "file" | "url";
@@ -454,10 +455,11 @@ const Index = () => {
               </p>
             </div>
           </div>
-          <div className="flex items-center gap-2">
+          <div className="flex items-center gap-4">
             <span className="text-xs text-primary font-medium flex items-center gap-1">
               <Sparkles className="w-3 h-3" /> Propulsé par l'IA
             </span>
+            <UserMenu />
           </div>
         </div>
       </header>

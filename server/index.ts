@@ -13,6 +13,9 @@ import { splitForTTS, generateSpeechChunk } from './services/tts.js';
 import { extractTextFromFile } from './services/document-parser.js';
 import { generatePodcastScript } from './services/podcast-generator.js';
 import { generatePodcastAudio } from './services/podcast-tts.js';
+import { createAuthMiddleware, requireAuth, requireQuota, requirePodcastAccess } from './lib/auth.js';
+import { recordUsage, getMonthlyUsage, checkQuota, PLAN_LIMITS } from './lib/quota.js';
+import { prisma } from './lib/prisma.js';
 
 config();
 
@@ -21,6 +24,9 @@ const app = express();
 
 app.use(cors());
 app.use(express.json());
+
+// Clerk auth middleware (noop if CLERK_SECRET_KEY not set)
+app.use(createAuthMiddleware());
 
 // Multer for file uploads (50MB limit)
 const upload = multer({
@@ -120,9 +126,60 @@ async function podcastPipeline(
   return `/api/audio/${podcastFileName}`;
 }
 
+// ===== User info & quota =====
+app.get('/api/user/me', requireAuth, async (req, res) => {
+  const user = (req as any).dbUser;
+  const quota = await checkQuota(user.id, user.plan);
+  const limits = PLAN_LIMITS[user.plan] || PLAN_LIMITS.free;
+
+  res.json({
+    id: user.id,
+    email: user.email,
+    plan: user.plan,
+    podcastEnabled: limits.podcastEnabled,
+    quota: {
+      used: quota.used,
+      limit: quota.limit,
+      remaining: quota.remaining,
+    },
+  });
+});
+
+app.get('/api/user/usage', requireAuth, async (req, res) => {
+  const user = (req as any).dbUser;
+  const now = new Date();
+  const startOfMonth = new Date(now.getFullYear(), now.getMonth(), 1);
+
+  const usages = await prisma.usage.findMany({
+    where: { userId: user.id, createdAt: { gte: startOfMonth } },
+    orderBy: { createdAt: 'desc' },
+    take: 50,
+  });
+
+  const summary = await prisma.usage.groupBy({
+    by: ['type'],
+    where: { userId: user.id, createdAt: { gte: startOfMonth } },
+    _sum: { creditsUsed: true },
+    _count: true,
+  });
+
+  res.json({ usages, summary });
+});
+
 // ===== YouTube processing (SSE stream) =====
-app.post('/api/process', async (req, res) => {
+app.post('/api/process', requireAuth, requireQuota, async (req, res) => {
+  const user = (req as any).dbUser;
   const { url, targetLanguage = 'fr', podcastMode = false } = req.body;
+
+  // Check podcast access
+  if (podcastMode) {
+    const limits = PLAN_LIMITS[user.plan] || PLAN_LIMITS.free;
+    if (!limits.podcastEnabled) {
+      return res.status(403).json({
+        error: 'Mode podcast réservé aux plans Pro et Business.',
+      });
+    }
+  }
 
   res.setHeader('Content-Type', 'text/event-stream');
   res.setHeader('Cache-Control', 'no-cache');
@@ -176,6 +233,14 @@ app.post('/api/process', async (req, res) => {
       audioUrl = await streamingTTS(res, translatedText, videoId, targetLanguage);
     }
 
+    // Record usage
+    const estimatedDuration = Math.ceil(translatedText.length / 15); // ~15 chars/second
+    await recordUsage(user.id, podcastMode ? 'podcast' : 'tts', {
+      durationSeconds: estimatedDuration,
+      inputChars: fullTranscript.length,
+      metadata: JSON.stringify({ videoId, targetLanguage, podcastMode }),
+    });
+
     sendSSE(res, {
       step: 'done',
       data: { audioUrl, translatedText, transcript: fullTranscript, videoId, podcastMode }
@@ -191,7 +256,9 @@ app.post('/api/process', async (req, res) => {
 });
 
 // ===== File processing (PDF/DOCX/TXT → translate → TTS) =====
-app.post('/api/process-file', upload.single('file'), async (req, res) => {
+app.post('/api/process-file', requireAuth, requireQuota, upload.single('file'), async (req, res) => {
+  const user = (req as any).dbUser;
+
   res.setHeader('Content-Type', 'text/event-stream');
   res.setHeader('Cache-Control', 'no-cache');
   res.setHeader('Connection', 'keep-alive');
@@ -248,6 +315,14 @@ app.post('/api/process-file', upload.single('file'), async (req, res) => {
       audioUrl = await streamingTTS(res, translatedText, filePrefix, targetLanguage);
     }
 
+    // Record usage
+    const estimatedDuration = Math.ceil(translatedText.length / 15);
+    await recordUsage(user.id, podcastMode ? 'podcast' : 'tts', {
+      durationSeconds: estimatedDuration,
+      inputChars: originalText.length,
+      metadata: JSON.stringify({ fileName: file.originalname, targetLanguage, podcastMode }),
+    });
+
     sendSSE(res, {
       step: 'done',
       data: { audioUrl, translatedText, transcript: originalText, podcastMode }
@@ -263,7 +338,15 @@ app.post('/api/process-file', upload.single('file'), async (req, res) => {
 });
 
 // ===== Generate podcast from existing translated text =====
-app.post('/api/generate-podcast', async (req, res) => {
+app.post('/api/generate-podcast', requireAuth, requireQuota, async (req, res) => {
+  const user = (req as any).dbUser;
+  const limits = PLAN_LIMITS[user.plan] || PLAN_LIMITS.free;
+  if (!limits.podcastEnabled) {
+    return res.status(403).json({
+      error: 'Mode podcast réservé aux plans Pro et Business.',
+    });
+  }
+
   const { translatedText } = req.body;
 
   res.setHeader('Content-Type', 'text/event-stream');
@@ -281,6 +364,13 @@ app.post('/api/generate-podcast', async (req, res) => {
     const filePrefix = `podcast_${Date.now()}`;
     const audioUrl = await podcastPipeline(res, translatedText, filePrefix);
 
+    // Record usage
+    const estimatedDuration = Math.ceil(translatedText.length / 15);
+    await recordUsage(user.id, 'podcast', {
+      durationSeconds: estimatedDuration,
+      inputChars: translatedText.length,
+    });
+
     sendSSE(res, {
       step: 'done',
       data: { audioUrl, translatedText, podcastMode: true }
@@ -294,7 +384,7 @@ app.post('/api/generate-podcast', async (req, res) => {
 });
 
 // ===== Merge video + translated audio =====
-app.post('/api/merge-video', async (req, res) => {
+app.post('/api/merge-video', requireAuth, async (req, res) => {
   const { videoId, audioUrl } = req.body;
 
   if (!videoId || !audioUrl) {
@@ -345,12 +435,15 @@ app.get('/api/health', (_req, res) => {
     google: !!process.env.GOOGLE_API_KEY,
     openrouter: !!process.env.OPENROUTER_API_KEY,
     elevenlabs: !!process.env.ELEVENLABS_API_KEY,
+    auth: !!process.env.CLERK_SECRET_KEY,
   });
 });
 
 const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => {
   console.log(`Server running on http://localhost:${PORT}`);
+  console.log(`Auth: ${process.env.CLERK_SECRET_KEY ? 'Clerk enabled' : 'disabled (dev mode)'}`);
+  console.log(`Database: SQLite (prisma)`);
   console.log(`OpenAI API key: ${process.env.OPENAI_API_KEY ? 'configured' : 'not set'}`);
   console.log(`Groq API key: ${process.env.GROQ_API_KEY ? 'configured (Whisper + translation)' : 'not set'}`);
   console.log(`OpenRouter API key: ${process.env.OPENROUTER_API_KEY ? 'configured (LLM fallback)' : 'not set'}`);
