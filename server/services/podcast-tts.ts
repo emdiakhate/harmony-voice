@@ -1,4 +1,5 @@
 import OpenAI from 'openai';
+import { ElevenLabsClient } from '@elevenlabs/elevenlabs-js';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
@@ -17,6 +18,12 @@ const SPEAKER_VOICES = {
   'Speaker 2': { voiceName: 'Kore' },
 };
 
+// ElevenLabs fallback voices
+const ELEVENLABS_VOICES: Record<string, string> = {
+  'Speaker 1': 'EXAVITQu4vr4xnSDxMaL', // Sarah - female voice
+  'Speaker 2': 'LivlNOmp4OEi5jd1LlSU', // second voice
+};
+
 // OpenAI fallback voices
 const OPENAI_VOICES: Record<string, 'onyx' | 'nova'> = {
   'Speaker 1': 'onyx',
@@ -25,41 +32,59 @@ const OPENAI_VOICES: Record<string, 'onyx' | 'nova'> = {
 
 interface PodcastTTSResult {
   audioBuffer: Buffer;
-  provider: 'gemini' | 'openai';
+  provider: 'gemini' | 'elevenlabs' | 'openai';
 }
 
 /**
  * Generate podcast audio from a multi-speaker script.
- * Tries Gemini 2.5 Flash TTS multi-speaker first, falls back to OpenAI TTS.
+ * Priority: Gemini > ElevenLabs > OpenAI
  */
 export async function generatePodcastAudio(
   script: string,
-  onProgress?: (progress: number, message: string) => void,
+  onProgress?: (progress: number, message: string, provider?: string) => void,
 ): Promise<PodcastTTSResult> {
-  const googleApiKey = process.env.GOOGLE_API_KEY;
-
-  if (googleApiKey) {
+  // 1. Try Gemini multi-speaker TTS
+  if (process.env.GOOGLE_API_KEY) {
     try {
       console.log('[PodcastTTS] Attempting Gemini multi-speaker TTS...');
-      const audioBuffer = await generateWithGemini(script, googleApiKey, onProgress);
+      onProgress?.(0, 'Génération avec Gemini...', 'gemini');
+      const audioBuffer = await generateWithGemini(script, process.env.GOOGLE_API_KEY, onProgress);
       console.log(`[PodcastTTS] Gemini success: ${(audioBuffer.length / 1024 / 1024).toFixed(2)}MB`);
       return { audioBuffer, provider: 'gemini' };
     } catch (error: any) {
       logGeminiError(error);
-      console.log('[PodcastTTS] Falling back to OpenAI TTS...');
-      onProgress?.(0, 'Gemini indisponible, utilisation de OpenAI...');
+      console.log('[PodcastTTS] Gemini failed, trying next provider...');
     }
-  } else {
-    console.log('[PodcastTTS] No GOOGLE_API_KEY set, using OpenAI TTS directly');
   }
 
-  // Fallback: OpenAI TTS with alternating voices (OpenRouter ne supporte pas TTS)
-  if (!process.env.OPENAI_API_KEY) {
-    throw new Error('Podcast TTS nécessite GOOGLE_API_KEY (Gemini) ou OPENAI_API_KEY. OpenRouter ne supporte pas le TTS audio.');
+  // 2. Try ElevenLabs multi-voice TTS
+  if (process.env.ELEVENLABS_API_KEY) {
+    try {
+      console.log('[PodcastTTS] Attempting ElevenLabs multi-voice TTS...');
+      onProgress?.(0, 'Génération avec ElevenLabs...', 'elevenlabs');
+      const audioBuffer = await generateWithElevenLabs(script, onProgress);
+      console.log(`[PodcastTTS] ElevenLabs success: ${(audioBuffer.length / 1024 / 1024).toFixed(2)}MB`);
+      return { audioBuffer, provider: 'elevenlabs' };
+    } catch (error: any) {
+      console.error('[PodcastTTS] ElevenLabs error:', error.message);
+      console.log('[PodcastTTS] ElevenLabs failed, trying next provider...');
+    }
   }
-  const audioBuffer = await generateWithOpenAI(script, onProgress);
-  console.log(`[PodcastTTS] OpenAI fallback success: ${(audioBuffer.length / 1024 / 1024).toFixed(2)}MB`);
-  return { audioBuffer, provider: 'openai' };
+
+  // 3. Fallback: OpenAI TTS
+  if (process.env.OPENAI_API_KEY) {
+    try {
+      console.log('[PodcastTTS] Using OpenAI TTS fallback...');
+      onProgress?.(0, 'Génération avec OpenAI...', 'openai');
+      const audioBuffer = await generateWithOpenAI(script, onProgress);
+      console.log(`[PodcastTTS] OpenAI fallback success: ${(audioBuffer.length / 1024 / 1024).toFixed(2)}MB`);
+      return { audioBuffer, provider: 'openai' };
+    } catch (error: any) {
+      console.error('[PodcastTTS] OpenAI error:', error.message);
+    }
+  }
+
+  throw new Error('Aucun provider Podcast TTS disponible. Configurez GOOGLE_API_KEY, ELEVENLABS_API_KEY ou OPENAI_API_KEY.');
 }
 
 /**
@@ -232,6 +257,51 @@ async function pcmToMp3(pcmBuffer: Buffer): Promise<Buffer> {
     try { fs.unlinkSync(pcmPath); } catch {}
     try { fs.unlinkSync(mp3Path); } catch {}
   }
+}
+
+/**
+ * Generate podcast audio with ElevenLabs using alternating voices.
+ */
+async function generateWithElevenLabs(
+  script: string,
+  onProgress?: (progress: number, message: string, provider?: string) => void,
+): Promise<Buffer> {
+  const elevenlabs = new ElevenLabsClient({ apiKey: process.env.ELEVENLABS_API_KEY });
+
+  const segments = parseScriptSegments(script);
+  console.log(`[PodcastTTS] ElevenLabs: ${segments.length} segments`);
+
+  const audioBuffers: Buffer[] = [];
+
+  for (let i = 0; i < segments.length; i++) {
+    const { speaker, text } = segments[i];
+    const voiceId = ELEVENLABS_VOICES[speaker] || ELEVENLABS_VOICES['Speaker 1'];
+
+    onProgress?.(
+      Math.round((i / segments.length) * 100),
+      `ElevenLabs (${i + 1}/${segments.length})...`,
+      'elevenlabs',
+    );
+
+    const subChunks = splitLongText(text, 4096);
+
+    for (const chunk of subChunks) {
+      const audio = await elevenlabs.textToSpeech.convert(voiceId, {
+        text: chunk,
+        modelId: 'eleven_multilingual_v2',
+        outputFormat: 'mp3_44100_128',
+      });
+
+      const parts: Uint8Array[] = [];
+      for await (const part of audio) {
+        parts.push(part);
+      }
+      audioBuffers.push(Buffer.concat(parts));
+    }
+  }
+
+  onProgress?.(100, 'Podcast audio généré avec ElevenLabs', 'elevenlabs');
+  return Buffer.concat(audioBuffers);
 }
 
 /**

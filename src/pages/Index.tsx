@@ -383,6 +383,53 @@ const Index = () => {
     }
   };
 
+  const handleGeneratePodcast = async () => {
+    if (!translation) return;
+
+    setIsProcessing(true);
+    setAudioUrl("");
+    setAudioChunks([]);
+    setPodcastScript("");
+    setErrorMessage("");
+
+    setSteps([
+      { id: "podcast_script", label: "Génération script podcast", status: "pending" },
+      { id: "podcast_tts", label: "Génération audio podcast", status: "pending" },
+    ]);
+
+    abortRef.current = new AbortController();
+
+    try {
+      const response = await fetch("/api/generate-podcast", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ translatedText: translation }),
+        signal: abortRef.current.signal,
+      });
+
+      if (!response.ok) {
+        throw new Error("Erreur serveur.");
+      }
+
+      await readSSEStream(response, handleSSEEvent);
+    } catch (error: any) {
+      if (error.name !== "AbortError") {
+        const msg = error.message || "Erreur de connexion au serveur";
+        setErrorMessage(msg);
+        setSteps((prev) =>
+          prev.map((s) =>
+            s.status === "active" || s.status === "pending"
+              ? { ...s, status: "error" }
+              : s
+          )
+        );
+        toast.error(msg);
+      }
+    } finally {
+      setIsProcessing(false);
+    }
+  };
+
   const previewVideoId =
     inputMode === "url" && youtubeUrl ? extractVideoId(youtubeUrl) : null;
   const displayVideoId = videoId || previewVideoId;
@@ -697,6 +744,19 @@ const Index = () => {
               isLoading={isProcessing && !translation}
             />
           </section>
+        )}
+
+        {/* Generate Podcast button (when translation exists and not already in podcast) */}
+        {translation && !isProcessing && !podcastScript && (
+          <div className="flex justify-center">
+            <button
+              onClick={handleGeneratePodcast}
+              className="flex items-center gap-2 px-6 py-3 rounded-xl bg-primary text-primary-foreground font-medium text-sm hover:opacity-90 transition-all"
+            >
+              <Radio className="w-4 h-4" />
+              Générer le Podcast à partir de la traduction
+            </button>
+          </div>
         )}
 
         {/* Podcast Script */}

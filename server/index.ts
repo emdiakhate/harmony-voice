@@ -100,10 +100,12 @@ async function podcastPipeline(
   console.log(`[Podcast] Script generated: ${podcastScript.length} chars`);
   sendSSE(res, { step: 'podcast_script_done', data: { script: podcastScript } });
 
-  // Step B: Generate podcast audio (Gemini or OpenAI fallback)
+  // Step B: Generate podcast audio (Gemini > ElevenLabs > OpenAI)
   sendSSE(res, { step: 'podcast_tts', message: 'Génération audio podcast...' });
-  const { audioBuffer, provider } = await generatePodcastAudio(podcastScript, (progress, message) => {
-    sendSSE(res, { step: 'podcast_tts_progress', data: { progress, message, provider } });
+  let currentProvider = '';
+  const { audioBuffer, provider } = await generatePodcastAudio(podcastScript, (progress, message, prov) => {
+    if (prov) currentProvider = prov;
+    sendSSE(res, { step: 'podcast_tts_progress', data: { progress, message, provider: currentProvider } });
   });
 
   console.log(`[Podcast] Audio generated with ${provider}: ${(audioBuffer.length / 1024 / 1024).toFixed(2)}MB`);
@@ -260,6 +262,37 @@ app.post('/api/process-file', upload.single('file'), async (req, res) => {
   res.end();
 });
 
+// ===== Generate podcast from existing translated text =====
+app.post('/api/generate-podcast', async (req, res) => {
+  const { translatedText } = req.body;
+
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+  res.setHeader('X-Accel-Buffering', 'no');
+  res.flushHeaders();
+
+  if (!translatedText || translatedText.trim().length === 0) {
+    sendSSE(res, { step: 'error', message: 'Texte traduit requis.' });
+    return res.end();
+  }
+
+  try {
+    const filePrefix = `podcast_${Date.now()}`;
+    const audioUrl = await podcastPipeline(res, translatedText, filePrefix);
+
+    sendSSE(res, {
+      step: 'done',
+      data: { audioUrl, translatedText, podcastMode: true }
+    });
+  } catch (error: any) {
+    console.error('[GeneratePodcast] Error:', error.message);
+    sendSSE(res, { step: 'error', message: error.message || 'Erreur inattendue' });
+  }
+
+  res.end();
+});
+
 // ===== Merge video + translated audio =====
 app.post('/api/merge-video', async (req, res) => {
   const { videoId, audioUrl } = req.body;
@@ -324,6 +357,6 @@ app.listen(PORT, () => {
   console.log(`ElevenLabs API key: ${process.env.ELEVENLABS_API_KEY ? 'configured (TTS fallback)' : 'not set'}`);
   console.log(`Google API key: ${process.env.GOOGLE_API_KEY ? 'configured (Gemini TTS podcast)' : 'not set'}`);
   console.log(`[Priority] Translation/LLM: Groq > OpenRouter > OpenAI`);
-  console.log(`[Priority] TTS: OpenAI > ElevenLabs | Podcast TTS: Gemini > OpenAI`);
+  console.log(`[Priority] TTS: OpenAI > ElevenLabs | Podcast TTS: Gemini > ElevenLabs > OpenAI`);
   console.log(`[Priority] Whisper: Groq > OpenAI`);
 });
