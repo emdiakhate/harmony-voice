@@ -18,15 +18,15 @@ model User {
 }
 
 model Usage {
-  id             String   @id @default(cuid())
-  userId         String
-  user           User     @relation(fields: [userId], references: [id])
-  type           String   // transcription, translation, tts, podcast
-  durationSeconds Int     @default(0)
-  creditsUsed    Int      @default(1) // 1 credit = 1 minute of audio
-  inputChars     Int      @default(0)
-  metadata       String?  // JSON string for extra info
-  createdAt      DateTime @default(now())
+  id              String   @id @default(cuid())
+  userId          String
+  user            User     @relation(fields: [userId], references: [id])
+  type            String   // transcription, translation, tts, podcast
+  durationSeconds Int      @default(0)
+  creditsUsed     Int      @default(1) // 1 credit = 1 minute of audio
+  inputChars      Int      @default(0)
+  metadata        Json?
+  createdAt       DateTime @default(now())
 
   @@index([userId, createdAt])
 }
