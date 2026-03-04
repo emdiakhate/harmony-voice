@@ -450,6 +450,6 @@ app.listen(PORT, () => {
   console.log(`ElevenLabs API key: ${process.env.ELEVENLABS_API_KEY ? 'configured (TTS fallback)' : 'not set'}`);
   console.log(`Google API key: ${process.env.GOOGLE_API_KEY ? 'configured (Gemini TTS podcast)' : 'not set'}`);
   console.log(`[Priority] Translation/LLM: Groq > OpenRouter > OpenAI`);
-  console.log(`[Priority] TTS: OpenAI > ElevenLabs | Podcast TTS: Gemini > ElevenLabs > OpenAI`);
+  console.log(`[Priority] TTS: ElevenLabs > OpenAI | Podcast TTS: Gemini > ElevenLabs > OpenAI`);
   console.log(`[Priority] Whisper: Groq > OpenAI`);
 });

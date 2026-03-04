@@ -38,51 +38,52 @@ export function splitForTTS(text: string): string[] {
 }
 
 /**
- * TTS provider priority: OpenAI > ElevenLabs
- * Falls back to ElevenLabs if OpenAI key is missing or quota is exhausted (429).
+ * TTS provider priority: ElevenLabs > OpenAI
+ * Uses ElevenLabs first to preserve OpenAI quota. Falls back to OpenAI if ElevenLabs unavailable.
  */
 export async function generateSpeechChunk(text: string): Promise<Buffer> {
-  // Try OpenAI first
-  if (process.env.OPENAI_API_KEY) {
+  // Try ElevenLabs first
+  if (process.env.ELEVENLABS_API_KEY) {
     try {
-      const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
-      const response = await openai.audio.speech.create({
-        model: 'tts-1',
-        voice: 'nova',
-        input: text,
-        response_format: 'mp3',
-      });
-      return Buffer.from(await response.arrayBuffer());
+      console.log('[TTS] Using ElevenLabs (eleven_multilingual_v2)');
+      const elevenlabs = new ElevenLabsClient({ apiKey: process.env.ELEVENLABS_API_KEY });
+      const audio = await elevenlabs.textToSpeech.convert(
+        'EXAVITQu4vr4xnSDxMaL', // "Sarah" - clear female voice
+        {
+          text,
+          modelId: 'eleven_multilingual_v2',
+          outputFormat: 'mp3_44100_128',
+        }
+      );
+      // Convert ReadableStream to Buffer
+      const chunks: Uint8Array[] = [];
+      for await (const chunk of audio) {
+        chunks.push(chunk);
+      }
+      return Buffer.concat(chunks);
     } catch (err: any) {
-      if (err?.status === 429 || err?.code === 'insufficient_quota') {
-        console.warn('[TTS] OpenAI quota exceeded, falling back to ElevenLabs...');
+      if (err?.status === 429 || err?.statusCode === 429) {
+        console.warn('[TTS] ElevenLabs quota exceeded, falling back to OpenAI...');
       } else {
         throw err;
       }
     }
   }
 
-  // Fallback: ElevenLabs
-  if (process.env.ELEVENLABS_API_KEY) {
-    console.log('[TTS] Using ElevenLabs (eleven_multilingual_v2)');
-    const elevenlabs = new ElevenLabsClient({ apiKey: process.env.ELEVENLABS_API_KEY });
-    const audio = await elevenlabs.textToSpeech.convert(
-      'EXAVITQu4vr4xnSDxMaL', // "Sarah" - clear female voice, similar to OpenAI nova
-      {
-        text,
-        modelId: 'eleven_multilingual_v2',
-        outputFormat: 'mp3_44100_128',
-      }
-    );
-    // Convert ReadableStream to Buffer
-    const chunks: Uint8Array[] = [];
-    for await (const chunk of audio) {
-      chunks.push(chunk);
-    }
-    return Buffer.concat(chunks);
+  // Fallback: OpenAI
+  if (process.env.OPENAI_API_KEY) {
+    console.log('[TTS] Using OpenAI TTS (tts-1, nova)');
+    const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+    const response = await openai.audio.speech.create({
+      model: 'tts-1',
+      voice: 'nova',
+      input: text,
+      response_format: 'mp3',
+    });
+    return Buffer.from(await response.arrayBuffer());
   }
 
-  throw new Error('Aucun provider TTS disponible. Configurez OPENAI_API_KEY ou ELEVENLABS_API_KEY dans .env');
+  throw new Error('Aucun provider TTS disponible. Configurez ELEVENLABS_API_KEY ou OPENAI_API_KEY dans .env');
 }
 
 export async function generateSpeech(
