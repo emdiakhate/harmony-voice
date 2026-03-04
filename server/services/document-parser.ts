@@ -19,10 +19,11 @@ export async function extractTextFromFile(filePath: string, originalName: string
 }
 
 async function extractFromPdf(filePath: string): Promise<string> {
-  // pdf-parse is CommonJS, use dynamic import
-  const pdfParse = (await import('pdf-parse')).default;
+  // pdf-parse is CommonJS, use dynamic import with fallback
+  const mod = await import('pdf-parse');
+  const pdfParse = typeof mod.default === 'function' ? mod.default : mod;
   const buffer = fs.readFileSync(filePath);
-  const result = await pdfParse(buffer);
+  const result = await (pdfParse as any)(buffer);
 
   if (!result.text || result.text.trim().length === 0) {
     throw new Error('Aucun texte trouvé dans le PDF. Le fichier est peut-être un scan/image.');

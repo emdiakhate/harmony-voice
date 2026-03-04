@@ -426,6 +426,121 @@ app.post('/api/merge-video', requireAuth, async (req, res) => {
   }
 });
 
+// ===== Saved Videos =====
+app.post('/api/videos/save', requireAuth, async (req, res) => {
+  const user = (req as any).dbUser;
+  const { title, youtubeUrl, sourceType, originalText, translatedText, audioUrl, targetLanguage, durationSeconds, thumbnailUrl } = req.body;
+
+  if (!title) return res.status(400).json({ error: 'title requis' });
+
+  const video = await prisma.savedVideo.create({
+    data: {
+      userId: user.id,
+      title,
+      youtubeUrl: youtubeUrl || null,
+      sourceType: sourceType || 'youtube',
+      originalText: originalText || null,
+      translatedText: translatedText || null,
+      audioUrl: audioUrl || null,
+      targetLanguage: targetLanguage || 'fr',
+      durationSeconds: durationSeconds || 0,
+      thumbnailUrl: thumbnailUrl || null,
+    },
+  });
+
+  res.json(video);
+});
+
+app.get('/api/videos', requireAuth, async (req, res) => {
+  const user = (req as any).dbUser;
+  const videos = await prisma.savedVideo.findMany({
+    where: { userId: user.id },
+    orderBy: { createdAt: 'desc' },
+    include: { playlists: { include: { playlist: true } } },
+  });
+  res.json(videos);
+});
+
+app.delete('/api/videos/:id', requireAuth, async (req, res) => {
+  const user = (req as any).dbUser;
+  const video = await prisma.savedVideo.findFirst({ where: { id: req.params.id, userId: user.id } });
+  if (!video) return res.status(404).json({ error: 'Vidéo non trouvée' });
+  await prisma.savedVideo.delete({ where: { id: video.id } });
+  res.json({ ok: true });
+});
+
+// ===== Playlists =====
+app.get('/api/playlists', requireAuth, async (req, res) => {
+  const user = (req as any).dbUser;
+  const playlists = await prisma.playlist.findMany({
+    where: { userId: user.id },
+    orderBy: { updatedAt: 'desc' },
+    include: { videos: { include: { video: true } } },
+  });
+  res.json(playlists);
+});
+
+app.post('/api/playlists', requireAuth, async (req, res) => {
+  const user = (req as any).dbUser;
+  const { name } = req.body;
+  if (!name || !name.trim()) return res.status(400).json({ error: 'Nom requis' });
+
+  const playlist = await prisma.playlist.create({
+    data: { userId: user.id, name: name.trim() },
+    include: { videos: { include: { video: true } } },
+  });
+  res.json(playlist);
+});
+
+app.delete('/api/playlists/:id', requireAuth, async (req, res) => {
+  const user = (req as any).dbUser;
+  const playlist = await prisma.playlist.findFirst({ where: { id: req.params.id, userId: user.id } });
+  if (!playlist) return res.status(404).json({ error: 'Playlist non trouvée' });
+  await prisma.playlist.delete({ where: { id: playlist.id } });
+  res.json({ ok: true });
+});
+
+app.post('/api/playlists/:id/videos', requireAuth, async (req, res) => {
+  const user = (req as any).dbUser;
+  const { videoId } = req.body;
+  const playlist = await prisma.playlist.findFirst({ where: { id: req.params.id, userId: user.id } });
+  if (!playlist) return res.status(404).json({ error: 'Playlist non trouvée' });
+
+  const video = await prisma.savedVideo.findFirst({ where: { id: videoId, userId: user.id } });
+  if (!video) return res.status(404).json({ error: 'Vidéo non trouvée' });
+
+  const existing = await prisma.playlistVideo.findUnique({
+    where: { playlistId_videoId: { playlistId: playlist.id, videoId: video.id } },
+  });
+  if (existing) return res.status(409).json({ error: 'Vidéo déjà dans la playlist' });
+
+  await prisma.playlistVideo.create({
+    data: { playlistId: playlist.id, videoId: video.id },
+  });
+
+  const updated = await prisma.playlist.findUnique({
+    where: { id: playlist.id },
+    include: { videos: { include: { video: true } } },
+  });
+  res.json(updated);
+});
+
+app.delete('/api/playlists/:playlistId/videos/:videoId', requireAuth, async (req, res) => {
+  const user = (req as any).dbUser;
+  const playlist = await prisma.playlist.findFirst({ where: { id: req.params.playlistId, userId: user.id } });
+  if (!playlist) return res.status(404).json({ error: 'Playlist non trouvée' });
+
+  await prisma.playlistVideo.deleteMany({
+    where: { playlistId: playlist.id, videoId: req.params.videoId },
+  });
+
+  const updated = await prisma.playlist.findUnique({
+    where: { id: playlist.id },
+    include: { videos: { include: { video: true } } },
+  });
+  res.json(updated);
+});
+
 // Health check
 app.get('/api/health', (_req, res) => {
   res.json({

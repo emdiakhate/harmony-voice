@@ -6,6 +6,7 @@ import { BrowserRouter, Routes, Route } from "react-router-dom";
 import { ClerkProvider, SignIn, SignUp } from "@clerk/clerk-react";
 import Index from "./pages/Index";
 import Dashboard from "./pages/Dashboard";
+import Playlists from "./pages/Playlists";
 import NotFound from "./pages/NotFound";
 import AuthGuard from "./components/AuthGuard";
 
@@ -32,6 +33,7 @@ const AppContent = () => (
           } />
           <Route path="/" element={<AuthGuard><Index /></AuthGuard>} />
           <Route path="/dashboard" element={<AuthGuard><Dashboard /></AuthGuard>} />
+          <Route path="/playlists" element={<AuthGuard><Playlists /></AuthGuard>} />
           <Route path="*" element={<NotFound />} />
         </Routes>
       </BrowserRouter>

@@ -16,6 +16,8 @@ import {
   Download,
   Music,
   Radio,
+  BookmarkPlus,
+  Check,
 } from "lucide-react";
 import FileDropZone from "@/components/FileDropZone";
 import LanguageSelector from "@/components/LanguageSelector";
@@ -101,6 +103,9 @@ const Index = () => {
   // Video download state
   const [isDownloadingVideo, setIsDownloadingVideo] = useState(false);
 
+  // Save state
+  const [isSaved, setIsSaved] = useState(false);
+
   const handleProcess = async () => {
     if (inputMode === "url" && !youtubeUrl) {
       toast.error("Veuillez coller un lien YouTube");
@@ -121,6 +126,7 @@ const Index = () => {
     setErrorMessage("");
     setVideoId("");
     setPodcastScript("");
+    setIsSaved(false);
 
     // Different steps depending on mode
     if (inputMode === "url") {
@@ -431,6 +437,42 @@ const Index = () => {
     }
   };
 
+  const handleSaveVideo = async () => {
+    const title =
+      inputMode === "url"
+        ? `YouTube — ${videoId || youtubeUrl}`
+        : selectedFile?.name || "Document";
+
+    const thumbnailUrl =
+      videoId ? `https://img.youtube.com/vi/${videoId}/mqdefault.jpg` : null;
+
+    const estimatedDuration = translation ? Math.ceil(translation.length / 15) : 0;
+
+    try {
+      const res = await fetch("/api/videos/save", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          title,
+          youtubeUrl: inputMode === "url" ? youtubeUrl : null,
+          sourceType: inputMode === "url" ? "youtube" : "file",
+          originalText: transcription || null,
+          translatedText: translation || null,
+          audioUrl: audioUrl || null,
+          targetLanguage: targetLang,
+          durationSeconds: estimatedDuration,
+          thumbnailUrl,
+        }),
+      });
+      if (res.ok) {
+        setIsSaved(true);
+        toast.success("Sauvegardé dans votre bibliothèque !");
+      }
+    } catch {
+      toast.error("Erreur lors de la sauvegarde");
+    }
+  };
+
   const previewVideoId =
     inputMode === "url" && youtubeUrl ? extractVideoId(youtubeUrl) : null;
   const displayVideoId = videoId || previewVideoId;
@@ -691,14 +733,14 @@ const Index = () => {
                 title="Audio traduit"
               />
 
-              {/* Download buttons */}
+              {/* Download + Save buttons */}
               {audioUrl && (
-                <div className="flex gap-3">
+                <div className="flex gap-3 flex-wrap">
                   {/* Download MP3 */}
                   <a
                     href={audioUrl}
                     download="audio_traduit.mp3"
-                    className="flex-1 py-3 rounded-xl bg-muted border border-border text-foreground font-medium text-sm hover:bg-muted/80 transition-all flex items-center justify-center gap-2"
+                    className="flex-1 min-w-[200px] py-3 rounded-xl bg-muted border border-border text-foreground font-medium text-sm hover:bg-muted/80 transition-all flex items-center justify-center gap-2"
                   >
                     <Music className="w-4 h-4" />
                     Télécharger l'audio (.mp3)
@@ -709,7 +751,7 @@ const Index = () => {
                     <button
                       onClick={handleDownloadVideo}
                       disabled={isDownloadingVideo}
-                      className="flex-1 py-3 rounded-xl bg-muted border border-border text-foreground font-medium text-sm hover:bg-muted/80 transition-all flex items-center justify-center gap-2 disabled:opacity-50"
+                      className="flex-1 min-w-[200px] py-3 rounded-xl bg-muted border border-border text-foreground font-medium text-sm hover:bg-muted/80 transition-all flex items-center justify-center gap-2 disabled:opacity-50"
                     >
                       {isDownloadingVideo ? (
                         <>
@@ -724,6 +766,29 @@ const Index = () => {
                       )}
                     </button>
                   )}
+
+                  {/* Save to library */}
+                  <button
+                    onClick={handleSaveVideo}
+                    disabled={isSaved}
+                    className={`flex-1 min-w-[200px] py-3 rounded-xl font-medium text-sm transition-all flex items-center justify-center gap-2 ${
+                      isSaved
+                        ? "bg-primary/10 border border-primary/30 text-primary"
+                        : "bg-primary text-primary-foreground hover:opacity-90"
+                    }`}
+                  >
+                    {isSaved ? (
+                      <>
+                        <Check className="w-4 h-4" />
+                        Sauvegardé
+                      </>
+                    ) : (
+                      <>
+                        <BookmarkPlus className="w-4 h-4" />
+                        Sauvegarder
+                      </>
+                    )}
+                  </button>
                 </div>
               )}
             </motion.section>

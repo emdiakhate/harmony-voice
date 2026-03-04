@@ -1,7 +1,7 @@
 import { UserButton, useAuth } from "@clerk/clerk-react";
 import { useUserQuota } from "@/hooks/useUserQuota";
 import { useNavigate } from "react-router-dom";
-import { BarChart3 } from "lucide-react";
+import { BarChart3, ListMusic } from "lucide-react";
 
 export default function UserMenu() {
   const clerkPubKey = import.meta.env.VITE_CLERK_PUBLISHABLE_KEY;
@@ -20,6 +20,13 @@ export default function UserMenu() {
     <div className="flex items-center gap-3">
       {user && (
         <>
+          <button
+            onClick={() => navigate("/playlists")}
+            className="flex items-center gap-1.5 text-xs text-muted-foreground hover:text-foreground transition-colors"
+          >
+            <ListMusic className="w-3.5 h-3.5" />
+            Playlists
+          </button>
           <button
             onClick={() => navigate("/dashboard")}
             className="flex items-center gap-1.5 text-xs text-muted-foreground hover:text-foreground transition-colors"
