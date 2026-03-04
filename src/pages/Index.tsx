@@ -264,6 +264,20 @@ const Index = () => {
           )
         );
         break;
+      case "translating_provider_switch":
+        toast.info(`Limite atteinte sur ${data.data.from}, basculement vers ${data.data.to}`);
+        setSteps((prev) =>
+          prev.map((s) =>
+            s.id === "translating"
+              ? { ...s, label: `Traduction (${data.data.to})` }
+              : s
+          )
+        );
+        break;
+      case "translating_partial":
+        setTranslation(data.data.translatedText);
+        toast.warning(`Traduction partielle : ${data.data.completedChunks}/${data.data.totalChunks} blocs traduits`);
+        break;
       case "translation_done":
         setTranslation(data.data.translatedText);
         setSteps((prev) =>

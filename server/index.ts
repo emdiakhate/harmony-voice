@@ -8,7 +8,7 @@ import fs from 'fs';
 import os from 'os';
 import { downloadYouTubeAudio, downloadYouTubeVideo, mergeVideoAudio, extractVideoId, cleanupAudioFile } from './services/youtube.js';
 import { transcribeAudio } from './services/transcriber.js';
-import { translateText } from './services/translator.js';
+import { translateText, PartialTranslationError } from './services/translator.js';
 import { splitForTTS, generateSpeechChunk } from './services/tts.js';
 import { extractTextFromFile } from './services/document-parser.js';
 import { generatePodcastScript } from './services/podcast-generator.js';
@@ -216,11 +216,37 @@ app.post('/api/process', requireAuth, requireQuota, async (req, res) => {
     cleanupAudioFile(audioPath);
     audioPath = null;
 
-    // Step 3: Translate
+    // Step 3: Translate (with auto-fallback and partial results)
     sendSSE(res, { step: 'translating', message: 'Traduction en cours...' });
-    const translatedText = await translateText(fullTranscript, targetLanguage, (progress) => {
-      sendSSE(res, { step: 'translating_progress', data: { progress } });
-    });
+    let translatedText: string;
+
+    try {
+      translatedText = await translateText(fullTranscript, targetLanguage, (progress) => {
+        sendSSE(res, { step: 'translating_progress', data: { progress } });
+      }, {
+        onProviderSwitch: (from, to) => {
+          console.log(`[Process] Provider switch: ${from} → ${to}`);
+          sendSSE(res, { step: 'translating_provider_switch', data: { from, to } });
+        },
+      });
+    } catch (error: any) {
+      if (error instanceof PartialTranslationError && error.partialText) {
+        translatedText = error.partialText;
+        console.log(`[Process] Partial translation: ${error.completedChunks}/${error.totalChunks} chunks`);
+        sendSSE(res, {
+          step: 'translating_partial',
+          data: {
+            translatedText: error.partialText,
+            completedChunks: error.completedChunks,
+            totalChunks: error.totalChunks,
+            message: error.message,
+          }
+        });
+      } else {
+        throw error;
+      }
+    }
+
     console.log(`[Process] Translation done: ${translatedText.length} chars`);
     sendSSE(res, { step: 'translation_done', data: { translatedText } });
 
@@ -295,12 +321,37 @@ app.post('/api/process-file', requireAuth, requireQuota, upload.single('file'), 
     // Cleanup uploaded file
     cleanupAudioFile(file.path);
 
-    // Step 2: Translate
+    // Step 2: Translate (with auto-fallback and partial results)
     sendSSE(res, { step: 'translating', message: 'Traduction en cours...' });
 
-    const translatedText = await translateText(originalText, targetLanguage, (progress) => {
-      sendSSE(res, { step: 'translating_progress', data: { progress } });
-    });
+    let translatedText: string;
+
+    try {
+      translatedText = await translateText(originalText, targetLanguage, (progress) => {
+        sendSSE(res, { step: 'translating_progress', data: { progress } });
+      }, {
+        onProviderSwitch: (from, to) => {
+          console.log(`[FileProcess] Provider switch: ${from} → ${to}`);
+          sendSSE(res, { step: 'translating_provider_switch', data: { from, to } });
+        },
+      });
+    } catch (error: any) {
+      if (error instanceof PartialTranslationError && error.partialText) {
+        translatedText = error.partialText;
+        console.log(`[FileProcess] Partial translation: ${error.completedChunks}/${error.totalChunks} chunks`);
+        sendSSE(res, {
+          step: 'translating_partial',
+          data: {
+            translatedText: error.partialText,
+            completedChunks: error.completedChunks,
+            totalChunks: error.totalChunks,
+            message: error.message,
+          }
+        });
+      } else {
+        throw error;
+      }
+    }
 
     console.log(`[FileProcess] Translation done: ${translatedText.length} chars`);
     sendSSE(res, { step: 'translation_done', data: { translatedText } });

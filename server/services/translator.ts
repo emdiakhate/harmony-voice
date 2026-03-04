@@ -18,6 +18,8 @@ const LANGUAGE_NAMES: Record<string, string> = {
 
 const CHUNK_SIZE = 3000;
 
+type Provider = 'groq' | 'openrouter' | 'openai';
+
 function splitTextIntoChunks(text: string, maxLength: number): string[] {
   const sentences = text.split(/(?<=[.!?])\s+/);
   const chunks: string[] = [];
@@ -34,7 +36,7 @@ function splitTextIntoChunks(text: string, maxLength: number): string[] {
 
   if (current.trim()) chunks.push(current.trim());
 
-  // If no sentence boundaries were found, split by word count
+  // If no sentence boundaries were found, split by character count
   if (chunks.length === 0 && text.length > 0) {
     for (let i = 0; i < text.length; i += maxLength) {
       chunks.push(text.slice(i, i + maxLength));
@@ -45,50 +47,155 @@ function splitTextIntoChunks(text: string, maxLength: number): string[] {
 }
 
 /**
- * Determine which LLM provider to use.
+ * Get ordered list of available providers.
  * Priority: Groq > OpenRouter > OpenAI
  */
-function getProvider(): 'groq' | 'openrouter' | 'openai' {
-  if (process.env.GROQ_API_KEY) return 'groq';
-  if (process.env.OPENROUTER_API_KEY) return 'openrouter';
-  return 'openai';
+function getAvailableProviders(): Provider[] {
+  const providers: Provider[] = [];
+  if (process.env.GROQ_API_KEY) providers.push('groq');
+  if (process.env.OPENROUTER_API_KEY) providers.push('openrouter');
+  if (process.env.OPENAI_API_KEY) providers.push('openai');
+  return providers;
+}
+
+function isRateLimitError(error: any): boolean {
+  if (error?.status === 429) return true;
+  if (error?.statusCode === 429) return true;
+  const msg = error?.message || error?.error?.message || '';
+  return msg.includes('rate_limit') || msg.includes('Rate limit') || msg.includes('429');
+}
+
+interface TranslateCallbacks {
+  onProgress?: (progress: number) => void;
+  onPartialResult?: (partialText: string, progress: number) => void;
+  onProviderSwitch?: (from: string, to: string) => void;
 }
 
 export async function translateText(
   text: string,
   targetLang: string,
-  onProgress?: (progress: number) => void
+  onProgress?: (progress: number) => void,
+  callbacks?: TranslateCallbacks
 ): Promise<string> {
   const langName = LANGUAGE_NAMES[targetLang] || targetLang;
   const chunks = splitTextIntoChunks(text, CHUNK_SIZE);
   const translatedChunks: string[] = [];
 
-  const provider = getProvider();
+  const availableProviders = getAvailableProviders();
+  if (availableProviders.length === 0) {
+    throw new Error('Aucune clé API configurée pour la traduction.');
+  }
+
+  // Track which providers are exhausted (rate limited)
+  const exhaustedProviders = new Set<Provider>();
+  let currentProviderIndex = 0;
+
+  function getCurrentProvider(): Provider | null {
+    while (currentProviderIndex < availableProviders.length) {
+      const p = availableProviders[currentProviderIndex];
+      if (!exhaustedProviders.has(p)) return p;
+      currentProviderIndex++;
+    }
+    return null;
+  }
+
+  let provider = getCurrentProvider();
+  if (!provider) throw new Error('Aucun fournisseur LLM disponible.');
+
   console.log(`[Translator] Using ${provider} for translation (${chunks.length} chunks)`);
 
   for (let i = 0; i < chunks.length; i++) {
     const chunk = chunks[i];
-    let translated: string;
+    let translated: string | null = null;
+    let lastError: any = null;
 
-    if (provider === 'groq') {
-      translated = await translateWithGroq(chunk, langName);
-    } else if (provider === 'openrouter') {
-      translated = await translateWithOpenRouter(chunk, langName);
-    } else {
-      translated = await translateWithOpenAI(chunk, langName);
+    // Try current provider, fallback on rate limit
+    while (!translated) {
+      if (!provider) {
+        // All providers exhausted — return partial results
+        if (translatedChunks.length > 0) {
+          const partial = translatedChunks.join(' ');
+          console.log(`[Translator] All providers rate-limited at chunk ${i}/${chunks.length}. Returning partial: ${translatedChunks.length} chunks translated.`);
+          throw new PartialTranslationError(
+            partial,
+            i,
+            chunks.length,
+            `Tous les fournisseurs sont en limite de débit. ${translatedChunks.length}/${chunks.length} chunks traduits.`
+          );
+        }
+        throw lastError || new Error('Tous les fournisseurs LLM sont en limite de débit.');
+      }
+
+      try {
+        translated = await translateChunk(provider, chunk, langName);
+      } catch (error: any) {
+        lastError = error;
+
+        if (isRateLimitError(error)) {
+          const oldProvider = provider;
+          exhaustedProviders.add(provider);
+          currentProviderIndex++;
+          provider = getCurrentProvider();
+
+          if (provider) {
+            console.log(`[Translator] Rate limit on ${oldProvider}, switching to ${provider} (chunk ${i + 1}/${chunks.length})`);
+            callbacks?.onProviderSwitch?.(oldProvider, provider);
+          }
+          // Loop will retry with new provider or exit if null
+        } else {
+          // Non-rate-limit error: throw immediately
+          if (translatedChunks.length > 0) {
+            throw new PartialTranslationError(
+              translatedChunks.join(' '),
+              i,
+              chunks.length,
+              error.message || 'Erreur de traduction'
+            );
+          }
+          throw error;
+        }
+      }
     }
 
     translatedChunks.push(translated);
-    onProgress?.(Math.round(((i + 1) / chunks.length) * 100));
+    const progress = Math.round(((i + 1) / chunks.length) * 100);
+    onProgress?.(progress);
+    callbacks?.onPartialResult?.(translatedChunks.join(' '), progress);
   }
 
   return translatedChunks.join(' ');
+}
+
+/**
+ * Error thrown when translation is partially complete.
+ * Contains the partial translation so the frontend can use it.
+ */
+export class PartialTranslationError extends Error {
+  public partialText: string;
+  public completedChunks: number;
+  public totalChunks: number;
+
+  constructor(partialText: string, completedChunks: number, totalChunks: number, message: string) {
+    super(message);
+    this.name = 'PartialTranslationError';
+    this.partialText = partialText;
+    this.completedChunks = completedChunks;
+    this.totalChunks = totalChunks;
+  }
 }
 
 const TRANSLATE_SYSTEM_PROMPT = (targetLang: string) =>
   `You are a professional translator. Translate the following text to ${targetLang}.
 Keep the same meaning, tone, and style. Output ONLY the translation, nothing else.
 If the text contains technical terms (programming, AI, etc.), translate naturally but keep well-known English technical terms when appropriate.`;
+
+async function translateChunk(provider: Provider, text: string, targetLang: string): Promise<string> {
+  switch (provider) {
+    case 'groq': return translateWithGroq(text, targetLang);
+    case 'openrouter': return translateWithOpenRouter(text, targetLang);
+    case 'openai': return translateWithOpenAI(text, targetLang);
+  }
+}
 
 async function translateWithOpenAI(text: string, targetLang: string): Promise<string> {
   const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
