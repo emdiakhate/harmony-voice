@@ -2,7 +2,7 @@ import { prisma } from './prisma.js';
 
 // Credits = minutes of audio. 1 credit ≈ 1 minute.
 export const PLAN_LIMITS: Record<string, { creditsPerMonth: number; podcastEnabled: boolean }> = {
-  free:     { creditsPerMonth: 15,   podcastEnabled: false },
+  free:     { creditsPerMonth: 100,  podcastEnabled: false },
   pro:      { creditsPerMonth: 300,  podcastEnabled: true },
   business: { creditsPerMonth: 1200, podcastEnabled: true },
 };
