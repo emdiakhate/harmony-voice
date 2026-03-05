@@ -50,6 +50,7 @@ export function splitForTTS(text: string): string[] {
  */
 let elevenLabsDisabled = false;
 let openAITTSDisabled = false;
+let geminiTTSDisabled = false;
 
 export async function generateSpeechChunk(text: string): Promise<Buffer> {
   // 1. Try ElevenLabs first (unless previously disabled)
@@ -105,13 +106,37 @@ export async function generateSpeechChunk(text: string): Promise<Buffer> {
     }
   }
 
-  // 3. Fallback: Gemini TTS (single-speaker mode)
-  if (process.env.GOOGLE_API_KEY) {
-    console.log('[TTS] Using Gemini TTS fallback (gemini-2.5-flash-preview-tts)');
-    return generateWithGemini(text, process.env.GOOGLE_API_KEY);
+  // 3. Fallback: Gemini TTS with retry (single-speaker mode)
+  if (process.env.GOOGLE_API_KEY && !geminiTTSDisabled) {
+    const MAX_RETRIES = 2;
+    for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+      try {
+        console.log(`[TTS] Using Gemini TTS fallback (gemini-2.5-flash-preview-tts)${attempt > 0 ? ` [retry ${attempt}/${MAX_RETRIES}]` : ''}`);
+        return await generateWithGemini(text, process.env.GOOGLE_API_KEY);
+      } catch (err: any) {
+        const status = err?.status;
+        if (status === 429) {
+          console.warn('[TTS] Gemini TTS quota exceeded, disabling.');
+          geminiTTSDisabled = true;
+          break;
+        }
+        if (status === 500 || status === 503) {
+          if (attempt < MAX_RETRIES) {
+            const delay = (attempt + 1) * 2000;
+            console.warn(`[TTS] Gemini TTS error ${status}, retrying in ${delay / 1000}s...`);
+            await new Promise(r => setTimeout(r, delay));
+            continue;
+          }
+          console.warn(`[TTS] Gemini TTS failed after ${MAX_RETRIES + 1} attempts, disabling.`);
+          geminiTTSDisabled = true;
+          break;
+        }
+        throw err;
+      }
+    }
   }
 
-  throw new Error('Aucun provider TTS disponible. Configurez ELEVENLABS_API_KEY, OPENAI_API_KEY ou GOOGLE_API_KEY dans .env');
+  throw new Error('Aucun provider TTS disponible. Tous les providers ont échoué ou sont désactivés.');
 }
 
 /**

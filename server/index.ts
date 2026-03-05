@@ -84,34 +84,58 @@ async function streamingTTS(
 
   console.log(`[TTS] Streaming: ${ttsChunks.length} chunks to generate`);
 
+  let ttsError: Error | null = null;
+
   for (let i = 0; i < ttsChunks.length; i++) {
-    const buffer = await generateSpeechChunk(ttsChunks[i]);
-    audioBuffers.push(buffer);
+    try {
+      const buffer = await generateSpeechChunk(ttsChunks[i]);
+      audioBuffers.push(buffer);
 
-    const chunkFileName = `${filePrefix}_${targetLanguage}_${timestamp}_chunk${i}.mp3`;
-    fs.writeFileSync(path.join(outputDir, chunkFileName), buffer);
+      const chunkFileName = `${filePrefix}_${targetLanguage}_${timestamp}_chunk${i}.mp3`;
+      fs.writeFileSync(path.join(outputDir, chunkFileName), buffer);
 
-    sendSSE(res, {
-      step: 'audio_chunk',
-      data: {
-        index: i,
-        total: ttsChunks.length,
-        audioUrl: `/api/audio/${chunkFileName}`,
-      }
-    });
+      sendSSE(res, {
+        step: 'audio_chunk',
+        data: {
+          index: i,
+          total: ttsChunks.length,
+          audioUrl: `/api/audio/${chunkFileName}`,
+        }
+      });
 
-    sendSSE(res, {
-      step: 'tts_progress',
-      data: { progress: Math.round(((i + 1) / ttsChunks.length) * 100) }
-    });
+      sendSSE(res, {
+        step: 'tts_progress',
+        data: { progress: Math.round(((i + 1) / ttsChunks.length) * 100) }
+      });
+    } catch (err: any) {
+      console.error(`[TTS] Error generating chunk ${i}/${ttsChunks.length}: ${err.message}`);
+      ttsError = err;
+      break;
+    }
   }
 
   const finalFileName = `${filePrefix}_${targetLanguage}_${timestamp}.mp3`;
   const finalPath = path.join(outputDir, finalFileName);
-  fs.writeFileSync(finalPath, Buffer.concat(audioBuffers));
+  const audioUrl = `/api/audio/${finalFileName}`;
 
-  console.log(`[TTS] Final audio saved: ${finalFileName}`);
-  return `/api/audio/${finalFileName}`;
+  if (audioBuffers.length > 0) {
+    fs.writeFileSync(finalPath, Buffer.concat(audioBuffers));
+    console.log(`[TTS] ${ttsError ? 'Partial' : 'Final'} audio saved: ${finalFileName} (${audioBuffers.length}/${ttsChunks.length} chunks)`);
+  }
+
+  if (ttsError) {
+    sendSSE(res, {
+      step: 'tts_partial_error',
+      data: {
+        message: `Génération audio interrompue après ${audioBuffers.length}/${ttsChunks.length} chunk(s): ${ttsError.message}`,
+        audioUrl: audioBuffers.length > 0 ? audioUrl : null,
+        generatedChunks: audioBuffers.length,
+        totalChunks: ttsChunks.length,
+      }
+    });
+  }
+
+  return audioBuffers.length > 0 ? audioUrl : '';
 }
 
 // Shared: pipelined translate → TTS (translation and audio generation run in parallel)
@@ -135,6 +159,8 @@ async function pipelinedTranslateAndTTS(
   let ttsResolve: (() => void) | null = null;
   let ttsRunning = false;
 
+  let ttsError: Error | null = null;
+
   async function processTTSQueue() {
     if (ttsRunning) return;
     ttsRunning = true;
@@ -144,22 +170,28 @@ async function pipelinedTranslateAndTTS(
       if (chunkText !== undefined) {
         // Split this translation chunk into TTS-sized pieces
         const ttsChunks = splitForTTS(chunkText);
-        for (const ttsText of ttsChunks) {
-          const buffer = await generateSpeechChunk(ttsText);
-          audioBuffers.push(buffer);
+        try {
+          for (const ttsText of ttsChunks) {
+            const buffer = await generateSpeechChunk(ttsText);
+            audioBuffers.push(buffer);
 
-          const chunkFileName = `${filePrefix}_${targetLanguage}_${timestamp}_chunk${ttsChunkFileCount}.mp3`;
-          fs.writeFileSync(path.join(outputDir, chunkFileName), buffer);
+            const chunkFileName = `${filePrefix}_${targetLanguage}_${timestamp}_chunk${ttsChunkFileCount}.mp3`;
+            fs.writeFileSync(path.join(outputDir, chunkFileName), buffer);
 
-          sendSSE(res, {
-            step: 'audio_chunk',
-            data: {
-              index: ttsChunkFileCount,
-              total: -1, // unknown total until translation finishes
-              audioUrl: `/api/audio/${chunkFileName}`,
-            }
-          });
-          ttsChunkFileCount++;
+            sendSSE(res, {
+              step: 'audio_chunk',
+              data: {
+                index: ttsChunkFileCount,
+                total: -1, // unknown total until translation finishes
+                audioUrl: `/api/audio/${chunkFileName}`,
+              }
+            });
+            ttsChunkFileCount++;
+          }
+        } catch (err: any) {
+          console.error(`[TTS] Error generating chunk ${nextTtsIndex}: ${err.message}`);
+          ttsError = err;
+          break;
         }
 
         translatedChunkMap.delete(nextTtsIndex);
@@ -240,15 +272,29 @@ async function pipelinedTranslateAndTTS(
   // Wait for remaining TTS to finish
   await ttsPromise;
 
-  console.log(`[Pipeline] TTS done: ${ttsChunkFileCount} audio chunks generated`);
-
-  // Write final concatenated audio
+  // Save whatever audio we have (full or partial)
   const finalFileName = `${filePrefix}_${targetLanguage}_${timestamp}.mp3`;
   const finalPath = path.join(outputDir, finalFileName);
-  fs.writeFileSync(finalPath, Buffer.concat(audioBuffers));
   const audioUrl = `/api/audio/${finalFileName}`;
 
-  return { translatedText, audioUrl };
+  if (audioBuffers.length > 0) {
+    fs.writeFileSync(finalPath, Buffer.concat(audioBuffers));
+    console.log(`[Pipeline] TTS ${ttsError ? 'partial' : 'done'}: ${ttsChunkFileCount} audio chunks generated`);
+  }
+
+  if (ttsError) {
+    // We have partial audio — notify the client but don't throw
+    sendSSE(res, {
+      step: 'tts_partial_error',
+      data: {
+        message: `Génération audio interrompue après ${ttsChunkFileCount} chunk(s): ${ttsError.message}`,
+        audioUrl: audioBuffers.length > 0 ? audioUrl : null,
+        generatedChunks: ttsChunkFileCount,
+      }
+    });
+  }
+
+  return { translatedText, audioUrl: audioBuffers.length > 0 ? audioUrl : '' };
 }
 
 // Shared: podcast pipeline (generate script → TTS)

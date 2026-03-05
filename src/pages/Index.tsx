@@ -373,8 +373,23 @@ const Index = () => {
         );
         break;
 
+      case "tts_partial_error":
+        // TTS failed mid-generation but we have partial audio
+        setIsTtsStreaming(false);
+        if (data.data.audioUrl) {
+          setAudioUrl(data.data.audioUrl);
+        }
+        setSteps((prev) =>
+          prev.map((s) =>
+            s.id === "tts"
+              ? { ...s, status: "error", label: `Audio partiel (${data.data.generatedChunks} chunk${data.data.generatedChunks > 1 ? 's' : ''})` }
+              : s
+          )
+        );
+        toast.warning(data.data.message);
+        break;
       case "done":
-        setAudioUrl(data.data.audioUrl);
+        if (data.data.audioUrl) setAudioUrl(data.data.audioUrl);
         setIsTtsStreaming(false);
         if (data.data.videoId) setVideoId(data.data.videoId);
         if (data.data.localVideoUrl) setLocalVideoUrl(data.data.localVideoUrl);
