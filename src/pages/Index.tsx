@@ -1,4 +1,4 @@
-import { useState, useRef } from "react";
+import { useState, useRef, useCallback } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import {
   FileAudio,
@@ -20,6 +20,7 @@ import {
   Check,
   FileVideo,
   Type,
+  SkipForward,
 } from "lucide-react";
 import FileDropZone from "@/components/FileDropZone";
 import LanguageSelector from "@/components/LanguageSelector";
@@ -89,7 +90,7 @@ async function readSSEStream(
 
 const Index = () => {
   const [inputMode, setInputMode] = useState<InputMode>("url");
-  const [selectedFile, setSelectedFile] = useState<File | null>(null);
+  const [selectedFiles, setSelectedFiles] = useState<File[]>([]);
   const [youtubeUrl, setYoutubeUrl] = useState("");
   const [sourceLang, setSourceLang] = useState("auto");
   const [targetLang, setTargetLang] = useState("fr");
@@ -121,18 +122,15 @@ const Index = () => {
   const [userTranscript, setUserTranscript] = useState("");
   const [skipTranslation, setSkipTranslation] = useState(false);
 
-  const handleProcess = async () => {
-    if (inputMode === "url" && !youtubeUrl) {
-      toast.error("Veuillez coller un lien YouTube");
-      return;
-    }
-    if (inputMode === "file" && !selectedFile) {
-      toast.error("Veuillez ajouter un fichier");
-      return;
-    }
+  // Multi-file queue
+  const [queueIndex, setQueueIndex] = useState(0);
+  const [waitingForNext, setWaitingForNext] = useState(false);
+  const [queueCompleted, setQueueCompleted] = useState(0);
 
-    // Reset state
-    setIsProcessing(true);
+  const isQueueMode = inputMode === "file" && selectedFiles.length > 1;
+  const currentFile = inputMode === "file" ? selectedFiles[queueIndex] : null;
+
+  const resetResultState = useCallback(() => {
     setTranscription("");
     setTranslation("");
     setAudioUrl("");
@@ -143,9 +141,81 @@ const Index = () => {
     setPodcastScript("");
     setShowSaveDialog(false);
     setLocalVideoUrl("");
+    setSteps([]);
+    setWaitingForNext(false);
+  }, []);
 
-    // Build steps depending on mode
+  const processFile = useCallback(async (file: File, signal: AbortSignal) => {
+    const isMedia = isMediaFile(file);
+    const hasUserTranscript = userTranscript.trim().length > 0;
+    const baseSteps: ProcessingStep[] = [];
+
+    if (!hasUserTranscript) {
+      if (isMedia) {
+        baseSteps.push({ id: "transcript", label: "Transcription Whisper IA", status: "pending" });
+      } else {
+        baseSteps.push({ id: "extract", label: "Extraction du texte", status: "pending" });
+      }
+    }
+
+    if (!skipTranslation) {
+      baseSteps.push({ id: "translating", label: "Traduction", status: "pending" });
+    }
+
+    if (podcastMode) {
+      baseSteps.push(
+        { id: "podcast_script", label: "Generation script podcast", status: "pending" },
+        { id: "podcast_tts", label: "Generation audio podcast", status: "pending" },
+      );
+    } else {
+      baseSteps.push({ id: "tts", label: "Generation de l'audio", status: "pending" });
+    }
+    setSteps(baseSteps);
+
+    const formData = new FormData();
+    formData.append("file", file);
+    formData.append("targetLanguage", targetLang);
+    formData.append("podcastMode", String(podcastMode));
+    if (userTranscript.trim()) {
+      formData.append("userTranscript", userTranscript.trim());
+    }
+    if (skipTranslation) {
+      formData.append("skipTranslation", "true");
+    }
+
+    const response = await fetch("/api/process-file", {
+      method: "POST",
+      body: formData,
+      signal,
+    });
+
+    if (!response.ok) {
+      throw new Error("Erreur serveur. Verifiez que le backend est lance.");
+    }
+
+    await readSSEStream(response, handleSSEEvent);
+  }, [targetLang, podcastMode, userTranscript, skipTranslation]);
+
+  const handleProcess = async () => {
+    if (inputMode === "url" && !youtubeUrl) {
+      toast.error("Veuillez coller un lien YouTube");
+      return;
+    }
+    if (inputMode === "file" && selectedFiles.length === 0) {
+      toast.error("Veuillez ajouter un fichier");
+      return;
+    }
+
+    // Reset state
+    setIsProcessing(true);
+    resetResultState();
+    setQueueIndex(0);
+    setQueueCompleted(0);
+
+    abortRef.current = new AbortController();
+
     if (inputMode === "url") {
+      // YouTube mode (unchanged)
       const baseSteps: ProcessingStep[] = [
         { id: "download", label: "Extraction audio YouTube", status: "pending" },
         { id: "transcript", label: "Transcription Whisper IA", status: "pending" },
@@ -160,72 +230,59 @@ const Index = () => {
         baseSteps.push({ id: "tts", label: "Generation de l'audio", status: "pending" });
       }
       setSteps(baseSteps);
-    } else {
-      const isMedia = selectedFile && isMediaFile(selectedFile);
-      const hasUserTranscript = userTranscript.trim().length > 0;
-      const baseSteps: ProcessingStep[] = [];
 
-      if (!hasUserTranscript) {
-        if (isMedia) {
-          baseSteps.push({ id: "transcript", label: "Transcription Whisper IA", status: "pending" });
-        } else {
-          baseSteps.push({ id: "extract", label: "Extraction du texte", status: "pending" });
-        }
-      }
-
-      if (!skipTranslation) {
-        baseSteps.push({ id: "translating", label: "Traduction", status: "pending" });
-      }
-
-      if (podcastMode) {
-        baseSteps.push(
-          { id: "podcast_script", label: "Generation script podcast", status: "pending" },
-          { id: "podcast_tts", label: "Generation audio podcast", status: "pending" },
-        );
-      } else {
-        baseSteps.push({ id: "tts", label: "Generation de l'audio", status: "pending" });
-      }
-      setSteps(baseSteps);
-    }
-
-    abortRef.current = new AbortController();
-
-    try {
-      let response: Response;
-
-      if (inputMode === "url") {
-        response = await fetch("/api/process", {
+      try {
+        const response = await fetch("/api/process", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ url: youtubeUrl, targetLanguage: targetLang, podcastMode }),
           signal: abortRef.current.signal,
         });
-      } else {
-        const formData = new FormData();
-        formData.append("file", selectedFile!);
-        formData.append("targetLanguage", targetLang);
-        formData.append("podcastMode", String(podcastMode));
-        if (userTranscript.trim()) {
-          formData.append("userTranscript", userTranscript.trim());
-        }
-        if (skipTranslation) {
-          formData.append("skipTranslation", "true");
+
+        if (!response.ok) {
+          throw new Error("Erreur serveur. Verifiez que le backend est lance.");
         }
 
-        response = await fetch("/api/process-file", {
-          method: "POST",
-          body: formData,
-          signal: abortRef.current.signal,
-        });
+        await readSSEStream(response, handleSSEEvent);
+      } catch (error: any) {
+        if (error.name !== "AbortError") {
+          const msg = error.message?.includes("Failed to fetch")
+            ? "Impossible de contacter le serveur. Lancez le backend avec: npm run dev:server"
+            : error.message || "Erreur de connexion au serveur";
+          setErrorMessage(msg);
+          setSteps((prev) =>
+            prev.map((s) =>
+              s.status === "active" || s.status === "pending"
+                ? { ...s, status: "error" }
+                : s
+            )
+          );
+          toast.error(msg);
+        }
+      } finally {
+        setIsProcessing(false);
+        setIsTtsStreaming(false);
+      }
+    } else {
+      // File mode: process queue
+      await processFileQueue(0);
+    }
+  };
+
+  const processFileQueue = async (startIndex: number) => {
+    for (let i = startIndex; i < selectedFiles.length; i++) {
+      setQueueIndex(i);
+      resetResultState();
+      setIsProcessing(true);
+
+      if (!abortRef.current || abortRef.current.signal.aborted) {
+        abortRef.current = new AbortController();
       }
 
-      if (!response.ok) {
-        throw new Error("Erreur serveur. Verifiez que le backend est lance.");
-      }
-
-      await readSSEStream(response, handleSSEEvent);
-    } catch (error: any) {
-      if (error.name !== "AbortError") {
+      try {
+        await processFile(selectedFiles[i], abortRef.current.signal);
+      } catch (error: any) {
+        if (error.name === "AbortError") return;
         const msg = error.message?.includes("Failed to fetch")
           ? "Impossible de contacter le serveur. Lancez le backend avec: npm run dev:server"
           : error.message || "Erreur de connexion au serveur";
@@ -239,9 +296,31 @@ const Index = () => {
         );
         toast.error(msg);
       }
-    } finally {
+
       setIsProcessing(false);
       setIsTtsStreaming(false);
+
+      // If there are more files, wait for user to proceed
+      if (i < selectedFiles.length - 1) {
+        setWaitingForNext(true);
+        // Wait for user to click "Next"
+        await new Promise<void>((resolve) => {
+          nextResolveRef.current = resolve;
+        });
+        nextResolveRef.current = null;
+        setWaitingForNext(false);
+        setQueueCompleted(i + 1);
+      } else {
+        setQueueCompleted(i + 1);
+      }
+    }
+  };
+
+  const nextResolveRef = useRef<(() => void) | null>(null);
+
+  const handleNextFile = () => {
+    if (nextResolveRef.current) {
+      nextResolveRef.current();
     }
   };
 
@@ -280,6 +359,27 @@ const Index = () => {
         setTranscription(data.data.text);
         setSteps((prev) =>
           prev.map((s) => (s.id === "extract" ? { ...s, status: "done" } : s))
+        );
+        break;
+
+      // Language detection
+      case "detecting_language":
+        setSteps((prev) =>
+          prev.map((s) =>
+            s.id === "translating" ? { ...s, status: "active", label: "Detection de la langue..." } : s
+          )
+        );
+        break;
+      case "language_detected":
+        break;
+      case "translation_skipped":
+        toast.info(data.data.message);
+        setSteps((prev) =>
+          prev.map((s) =>
+            s.id === "translating"
+              ? { ...s, status: "done", label: `Traduction ignoree (deja en ${data.data.detectedLang})` }
+              : s
+          )
         );
         break;
 
@@ -333,6 +433,22 @@ const Index = () => {
         );
         break;
 
+      case "tts_partial_error":
+        // TTS failed mid-generation but we have partial audio
+        setIsTtsStreaming(false);
+        if (data.data.audioUrl) {
+          setAudioUrl(data.data.audioUrl);
+        }
+        setSteps((prev) =>
+          prev.map((s) =>
+            s.id === "tts"
+              ? { ...s, status: "error", label: `Audio partiel (${data.data.generatedChunks} chunk${data.data.generatedChunks > 1 ? 's' : ''})` }
+              : s
+          )
+        );
+        toast.warning(data.data.message);
+        break;
+
       // Podcast-specific steps
       case "podcast_script":
         setSteps((prev) =>
@@ -373,21 +489,6 @@ const Index = () => {
         );
         break;
 
-      case "tts_partial_error":
-        // TTS failed mid-generation but we have partial audio
-        setIsTtsStreaming(false);
-        if (data.data.audioUrl) {
-          setAudioUrl(data.data.audioUrl);
-        }
-        setSteps((prev) =>
-          prev.map((s) =>
-            s.id === "tts"
-              ? { ...s, status: "error", label: `Audio partiel (${data.data.generatedChunks} chunk${data.data.generatedChunks > 1 ? 's' : ''})` }
-              : s
-          )
-        );
-        toast.warning(data.data.message);
-        break;
       case "done":
         if (data.data.audioUrl) setAudioUrl(data.data.audioUrl);
         setIsTtsStreaming(false);
@@ -414,8 +515,10 @@ const Index = () => {
 
   const handleCancel = () => {
     abortRef.current?.abort();
+    nextResolveRef.current?.();
     setIsProcessing(false);
     setIsTtsStreaming(false);
+    setWaitingForNext(false);
     setSteps([]);
     toast.info("Traitement annule");
   };
@@ -514,6 +617,20 @@ const Index = () => {
     }
   };
 
+  const handleFilesSelect = (newFiles: File[]) => {
+    setSelectedFiles((prev) => [...prev, ...newFiles]);
+  };
+
+  const handleRemoveFile = (index: number) => {
+    setSelectedFiles((prev) => prev.filter((_, i) => i !== index));
+  };
+
+  const handleClearFiles = () => {
+    setSelectedFiles([]);
+    setUserTranscript("");
+    setSkipTranslation(false);
+  };
+
   const previewVideoId =
     inputMode === "url" && youtubeUrl ? extractVideoId(youtubeUrl) : null;
   const displayVideoId = videoId || previewVideoId;
@@ -523,7 +640,7 @@ const Index = () => {
   const saveTitle =
     inputMode === "url"
       ? `YouTube - ${videoId || youtubeUrl}`
-      : selectedFile?.name || "Document";
+      : currentFile?.name || "Document";
 
   return (
     <div className="min-h-screen bg-background">
@@ -564,7 +681,7 @@ const Index = () => {
             <span className="text-primary"> instantanement</span>
           </h2>
           <p className="text-muted-foreground max-w-xl mx-auto">
-            Collez un lien YouTube ou importez un fichier (video, audio, PDF, Word) pour
+            Collez un lien YouTube ou importez un ou plusieurs fichiers (video, audio, PDF, Word) pour
             obtenir la traduction audio dans la langue de votre choix.
           </p>
         </motion.section>
@@ -606,18 +723,16 @@ const Index = () => {
           {inputMode === "file" ? (
             <div className="space-y-4">
               <FileDropZone
-                onFileSelect={setSelectedFile}
-                selectedFile={selectedFile}
-                onClear={() => {
-                  setSelectedFile(null);
-                  setUserTranscript("");
-                  setSkipTranslation(false);
-                }}
+                onFilesSelect={handleFilesSelect}
+                selectedFiles={selectedFiles}
+                onClear={handleClearFiles}
+                onRemoveFile={handleRemoveFile}
                 acceptTypes="all"
+                disabled={isProcessing || waitingForNext}
               />
 
-              {/* Transcript-only mode: show when a media file is selected */}
-              {selectedFile && (
+              {/* Transcript-only mode: show when a single file is selected */}
+              {selectedFiles.length === 1 && (
                 <div className="space-y-3 p-4 rounded-xl bg-muted/50 border border-border/50">
                   <div className="flex items-center gap-2">
                     <Type className="w-4 h-4 text-muted-foreground" />
@@ -717,20 +832,81 @@ const Index = () => {
               <XCircle className="w-5 h-5" />
               Annuler le traitement
             </button>
-          ) : (
+          ) : !waitingForNext ? (
             <button
               onClick={handleProcess}
-              className="w-full py-4 rounded-xl bg-primary text-primary-foreground font-display font-semibold text-base hover:brightness-110 transition-all flex items-center justify-center gap-2"
+              disabled={inputMode === "file" && selectedFiles.length === 0}
+              className="w-full py-4 rounded-xl bg-primary text-primary-foreground font-display font-semibold text-base hover:brightness-110 transition-all flex items-center justify-center gap-2 disabled:opacity-50"
             >
               <Mic className="w-5 h-5" />
               {skipTranslation
                 ? "Generer l'audio"
                 : inputMode === "file"
-                ? "Traduire & Generer l'audio"
+                ? selectedFiles.length > 1
+                  ? `Traduire ${selectedFiles.length} fichiers`
+                  : "Traduire & Generer l'audio"
                 : "Transcrire & Traduire"}
             </button>
-          )}
+          ) : null}
         </motion.section>
+
+        {/* Queue Progress Bar */}
+        <AnimatePresence>
+          {isQueueMode && (isProcessing || waitingForNext || queueCompleted > 0) && (
+            <motion.section
+              initial={{ opacity: 0, height: 0 }}
+              animate={{ opacity: 1, height: "auto" }}
+              exit={{ opacity: 0, height: 0 }}
+              className="glass-card p-4"
+            >
+              <div className="flex items-center justify-between mb-2">
+                <p className="text-sm font-medium text-foreground">
+                  File d'attente
+                </p>
+                <p className="text-sm text-muted-foreground">
+                  {Math.min(queueIndex + 1, selectedFiles.length)} / {selectedFiles.length}
+                </p>
+              </div>
+              <div className="w-full h-2 bg-muted rounded-full overflow-hidden">
+                <div
+                  className="h-full bg-primary rounded-full transition-all duration-500"
+                  style={{ width: `${(queueCompleted / selectedFiles.length) * 100}%` }}
+                />
+              </div>
+              <div className="mt-2 flex flex-wrap gap-1.5">
+                {selectedFiles.map((file, i) => (
+                  <span
+                    key={i}
+                    className={`text-xs px-2 py-1 rounded-md ${
+                      i < queueCompleted
+                        ? "bg-primary/20 text-primary"
+                        : i === queueIndex
+                        ? "bg-primary text-primary-foreground"
+                        : "bg-muted text-muted-foreground"
+                    }`}
+                  >
+                    {file.name.length > 20 ? file.name.slice(0, 17) + "..." : file.name}
+                  </span>
+                ))}
+              </div>
+            </motion.section>
+          )}
+        </AnimatePresence>
+
+        {/* Current file being processed */}
+        <AnimatePresence>
+          {isQueueMode && (isProcessing || waitingForNext) && currentFile && (
+            <motion.div
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              className="text-center"
+            >
+              <p className="text-sm text-muted-foreground">
+                Traitement en cours : <strong className="text-foreground">{currentFile.name}</strong>
+              </p>
+            </motion.div>
+          )}
+        </AnimatePresence>
 
         {/* Processing Steps */}
         <AnimatePresence>
@@ -847,7 +1023,7 @@ const Index = () => {
           )}
         </AnimatePresence>
 
-        {/* Save/Download button */}
+        {/* Save/Download + Next File buttons */}
         <AnimatePresence>
           {audioUrl && !isProcessing && (
             <motion.section
@@ -861,6 +1037,36 @@ const Index = () => {
               >
                 <BookmarkPlus className="w-4 h-4" />
                 Enregistrer / Telecharger
+              </button>
+
+              {/* Next file button in queue */}
+              {waitingForNext && (
+                <button
+                  onClick={handleNextFile}
+                  className="flex-1 min-w-[200px] py-3 rounded-xl bg-primary text-primary-foreground font-medium text-sm hover:opacity-90 transition-all flex items-center justify-center gap-2 animate-pulse"
+                >
+                  <SkipForward className="w-4 h-4" />
+                  Fichier suivant ({queueIndex + 2}/{selectedFiles.length})
+                </button>
+              )}
+            </motion.section>
+          )}
+        </AnimatePresence>
+
+        {/* Next file button even when no audio (error case) */}
+        <AnimatePresence>
+          {waitingForNext && !audioUrl && !isProcessing && (
+            <motion.section
+              initial={{ opacity: 0, y: 20 }}
+              animate={{ opacity: 1, y: 0 }}
+              className="flex gap-3 flex-wrap"
+            >
+              <button
+                onClick={handleNextFile}
+                className="flex-1 py-3 rounded-xl bg-primary text-primary-foreground font-medium text-sm hover:opacity-90 transition-all flex items-center justify-center gap-2"
+              >
+                <SkipForward className="w-4 h-4" />
+                Passer au fichier suivant ({queueIndex + 2}/{selectedFiles.length})
               </button>
             </motion.section>
           )}

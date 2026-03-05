@@ -72,6 +72,59 @@ interface TranslateCallbacks {
   onChunkTranslated?: (index: number, text: string, totalChunks: number) => void;
 }
 
+/**
+ * Detect the language of a text sample using the first available LLM provider.
+ * Returns ISO 639-1 code (e.g. 'fr', 'en', 'es') or 'unknown'.
+ */
+export async function detectLanguage(text: string): Promise<string> {
+  const sample = text.slice(0, 1000);
+  const providers = getAvailableProviders();
+  if (providers.length === 0) return 'unknown';
+
+  const systemPrompt = `Detect the language of the following text. Reply with ONLY the ISO 639-1 language code (e.g. "fr", "en", "es", "de", "pt", "it", "ar", "zh", "ja", "ko", "ru", "hi"). Nothing else.`;
+
+  for (const provider of providers) {
+    try {
+      const result = await detectWithProvider(provider, systemPrompt, sample);
+      const code = result.trim().toLowerCase().replace(/[^a-z]/g, '').slice(0, 2);
+      if (code && code.length === 2) {
+        console.log(`[Translator] Detected language: ${code} (via ${provider})`);
+        return code;
+      }
+    } catch (err: any) {
+      console.warn(`[Translator] Language detection failed with ${provider}: ${err.message}`);
+      continue;
+    }
+  }
+  return 'unknown';
+}
+
+async function detectWithProvider(provider: Provider, systemPrompt: string, text: string): Promise<string> {
+  switch (provider) {
+    case 'groq': {
+      const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
+      const r = await groq.chat.completions.create({
+        model: 'llama-3.3-70b-versatile', messages: [{ role: 'system', content: systemPrompt }, { role: 'user', content: text }], temperature: 0, max_tokens: 5,
+      });
+      return r.choices[0].message.content || '';
+    }
+    case 'openrouter': {
+      const or = new OpenAI({ apiKey: process.env.OPENROUTER_API_KEY, baseURL: 'https://openrouter.ai/api/v1' });
+      const r = await or.chat.completions.create({
+        model: 'meta-llama/llama-3.3-70b-instruct', messages: [{ role: 'system', content: systemPrompt }, { role: 'user', content: text }], temperature: 0, max_tokens: 5,
+      });
+      return r.choices[0].message.content || '';
+    }
+    case 'openai': {
+      const oa = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+      const r = await oa.chat.completions.create({
+        model: 'gpt-4o-mini', messages: [{ role: 'system', content: systemPrompt }, { role: 'user', content: text }], temperature: 0, max_tokens: 5,
+      });
+      return r.choices[0].message.content || '';
+    }
+  }
+}
+
 export async function translateText(
   text: string,
   targetLang: string,

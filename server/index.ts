@@ -8,7 +8,7 @@ import fs from 'fs';
 import os from 'os';
 import { downloadYouTubeAudio, downloadYouTubeVideo, mergeVideoAudio, extractVideoId, cleanupAudioFile } from './services/youtube.js';
 import { transcribeAudio } from './services/transcriber.js';
-import { translateText, PartialTranslationError } from './services/translator.js';
+import { translateText, PartialTranslationError, detectLanguage } from './services/translator.js';
 import { splitForTTS, generateSpeechChunk } from './services/tts.js';
 import { extractTextFromFile } from './services/document-parser.js';
 import { generatePodcastScript } from './services/podcast-generator.js';
@@ -423,7 +423,26 @@ app.post('/api/process', requireAuth, requireQuota, async (req, res) => {
     let translatedText: string;
     let audioUrl: string;
 
-    if (podcastMode) {
+    // Auto-detect language
+    sendSSE(res, { step: 'detecting_language', message: 'Détection de la langue...' });
+    const detectedLang = await detectLanguage(fullTranscript);
+    sendSSE(res, { step: 'language_detected', data: { detectedLang } });
+    const skipTranslation = detectedLang === targetLanguage;
+    if (skipTranslation) {
+      console.log(`[Process] Transcript already in ${targetLanguage}, skipping translation`);
+      sendSSE(res, { step: 'translation_skipped', data: { detectedLang, targetLanguage, message: `Le texte est déjà en ${targetLanguage}, traduction ignorée.` } });
+    }
+
+    if (skipTranslation) {
+      // Already in target language — direct TTS
+      translatedText = fullTranscript;
+      sendSSE(res, { step: 'translation_done', data: { translatedText, skipped: true } });
+      if (podcastMode) {
+        audioUrl = await podcastPipeline(res, translatedText, videoId);
+      } else {
+        audioUrl = await streamingTTS(res, translatedText, videoId, targetLanguage);
+      }
+    } else if (podcastMode) {
       // Podcast mode: translate first, then generate script + audio
       sendSSE(res, { step: 'translating', message: 'Traduction en cours...' });
 
@@ -500,7 +519,7 @@ app.post('/api/process-file', requireAuth, requireQuota, upload.single('file'), 
   const targetLanguage = req.body?.targetLanguage || 'fr';
   const podcastMode = req.body?.podcastMode === 'true';
   const userTranscript = req.body?.userTranscript?.trim() || '';
-  const skipTranslation = req.body?.skipTranslation === 'true';
+  let skipTranslation = req.body?.skipTranslation === 'true';
 
   if (!file) {
     sendSSE(res, { step: 'error', message: 'Aucun fichier reçu.' });
@@ -581,6 +600,18 @@ app.post('/api/process-file', requireAuth, requireQuota, upload.single('file'), 
     const filePrefix = `file_${Date.now()}`;
     let translatedText: string;
     let audioUrl: string;
+
+    // Auto-detect language: skip translation if already in target language
+    if (!skipTranslation) {
+      sendSSE(res, { step: 'detecting_language', message: 'Détection de la langue...' });
+      const detectedLang = await detectLanguage(originalText);
+      sendSSE(res, { step: 'language_detected', data: { detectedLang } });
+      if (detectedLang === targetLanguage) {
+        skipTranslation = true;
+        console.log(`[FileProcess] Text already in ${targetLanguage}, skipping translation`);
+        sendSSE(res, { step: 'translation_skipped', data: { detectedLang, targetLanguage, message: `Le texte est déjà en ${targetLanguage}, traduction ignorée.` } });
+      }
+    }
 
     if (skipTranslation) {
       // User provided transcript already in target language — skip translation, just TTS
