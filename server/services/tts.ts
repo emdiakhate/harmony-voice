@@ -40,10 +40,13 @@ export function splitForTTS(text: string): string[] {
 /**
  * TTS provider priority: ElevenLabs > OpenAI
  * Uses ElevenLabs first to preserve OpenAI quota. Falls back to OpenAI if ElevenLabs unavailable.
+ * Once ElevenLabs fails with quota error, all subsequent calls use OpenAI directly.
  */
+let elevenLabsDisabled = false;
+
 export async function generateSpeechChunk(text: string): Promise<Buffer> {
-  // Try ElevenLabs first
-  if (process.env.ELEVENLABS_API_KEY) {
+  // Try ElevenLabs first (unless previously disabled by quota error)
+  if (process.env.ELEVENLABS_API_KEY && !elevenLabsDisabled) {
     try {
       console.log('[TTS] Using ElevenLabs (eleven_multilingual_v2)');
       const elevenlabs = new ElevenLabsClient({ apiKey: process.env.ELEVENLABS_API_KEY });
@@ -62,8 +65,11 @@ export async function generateSpeechChunk(text: string): Promise<Buffer> {
       }
       return Buffer.concat(chunks);
     } catch (err: any) {
-      if (err?.status === 429 || err?.statusCode === 429) {
-        console.warn('[TTS] ElevenLabs quota exceeded, falling back to OpenAI...');
+      const status = err?.status || err?.statusCode;
+      const isQuotaExceeded = err?.body?.detail?.status === 'quota_exceeded';
+      if (status === 429 || (status === 401 && isQuotaExceeded)) {
+        console.warn('[TTS] ElevenLabs quota exceeded, disabling for this session. Falling back to OpenAI...');
+        elevenLabsDisabled = true;
       } else {
         throw err;
       }
