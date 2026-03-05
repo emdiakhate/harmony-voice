@@ -474,15 +474,20 @@ app.post('/api/process-file', requireAuth, requireQuota, upload.single('file'), 
       cleanupAudioFile(file.path);
     } else if (fileCategory === 'media') {
       // Media file: transcribe with Whisper
+      // Multer saves without extension — rename so the API can detect the file type
+      const ext = path.extname(file.originalname).toLowerCase();
+      const renamedPath = file.path + ext;
+      fs.renameSync(file.path, renamedPath);
+
       sendSSE(res, { step: 'transcript', message: 'Transcription audio/vidéo avec Whisper IA...' });
-      const { text: transcript, segments } = await transcribeAudio(file.path);
+      const { text: transcript, segments } = await transcribeAudio(renamedPath);
       originalText = transcript;
       console.log(`[FileProcess] Transcribed media: ${segments.length} segments, ${originalText.length} chars from ${file.originalname}`);
       sendSSE(res, {
         step: 'transcript_done',
         data: { transcript: originalText, segmentCount: segments.length }
       });
-      cleanupAudioFile(file.path);
+      cleanupAudioFile(renamedPath);
     } else {
       // Document: extract text
       sendSSE(res, { step: 'extract', message: 'Extraction du texte du document...' });
