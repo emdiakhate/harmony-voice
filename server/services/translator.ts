@@ -69,6 +69,7 @@ interface TranslateCallbacks {
   onProgress?: (progress: number) => void;
   onPartialResult?: (partialText: string, progress: number) => void;
   onProviderSwitch?: (from: string, to: string) => void;
+  onChunkTranslated?: (index: number, text: string, totalChunks: number) => void;
 }
 
 export async function translateText(
@@ -160,6 +161,7 @@ export async function translateText(
     translatedChunks.push(translated);
     const progress = Math.round(((i + 1) / chunks.length) * 100);
     onProgress?.(progress);
+    callbacks?.onChunkTranslated?.(i, translated, chunks.length);
     callbacks?.onPartialResult?.(translatedChunks.join(' '), progress);
   }
 

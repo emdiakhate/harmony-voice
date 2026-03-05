@@ -94,6 +94,143 @@ async function streamingTTS(
   return `/api/audio/${finalFileName}`;
 }
 
+// Shared: pipelined translate → TTS (translation and audio generation run in parallel)
+// As each translation chunk completes, it's immediately queued for TTS generation.
+async function pipelinedTranslateAndTTS(
+  res: express.Response,
+  sourceText: string,
+  filePrefix: string,
+  targetLanguage: string,
+): Promise<{ translatedText: string; audioUrl: string }> {
+  const timestamp = Date.now();
+  const audioBuffers: Buffer[] = [];
+  let nextTtsIndex = 0;
+  const translatedChunkMap = new Map<number, string>();
+  let translationComplete = false;
+  let translationError: Error | null = null;
+  let totalTranslationChunks = 0;
+  let ttsChunkFileCount = 0;
+
+  // TTS queue processor: generates audio for translated chunks in order
+  let ttsResolve: (() => void) | null = null;
+  let ttsRunning = false;
+
+  async function processTTSQueue() {
+    if (ttsRunning) return;
+    ttsRunning = true;
+
+    while (true) {
+      const chunkText = translatedChunkMap.get(nextTtsIndex);
+      if (chunkText !== undefined) {
+        // Split this translation chunk into TTS-sized pieces
+        const ttsChunks = splitForTTS(chunkText);
+        for (const ttsText of ttsChunks) {
+          const buffer = await generateSpeechChunk(ttsText);
+          audioBuffers.push(buffer);
+
+          const chunkFileName = `${filePrefix}_${targetLanguage}_${timestamp}_chunk${ttsChunkFileCount}.mp3`;
+          fs.writeFileSync(path.join(outputDir, chunkFileName), buffer);
+
+          sendSSE(res, {
+            step: 'audio_chunk',
+            data: {
+              index: ttsChunkFileCount,
+              total: -1, // unknown total until translation finishes
+              audioUrl: `/api/audio/${chunkFileName}`,
+            }
+          });
+          ttsChunkFileCount++;
+        }
+
+        translatedChunkMap.delete(nextTtsIndex);
+        nextTtsIndex++;
+
+        // Update TTS progress based on how many translation chunks we've processed
+        if (totalTranslationChunks > 0) {
+          sendSSE(res, {
+            step: 'tts_progress',
+            data: { progress: Math.round((nextTtsIndex / totalTranslationChunks) * 100) }
+          });
+        }
+      } else if (translationComplete || translationError) {
+        break;
+      } else {
+        // Wait for new chunks
+        await new Promise<void>((resolve) => {
+          ttsResolve = resolve;
+        });
+        ttsResolve = null;
+      }
+    }
+
+    ttsRunning = false;
+  }
+
+  // Start translation with chunk callback
+  sendSSE(res, { step: 'translating', message: 'Traduction en cours...' });
+  sendSSE(res, { step: 'tts', message: "Génération audio en parallèle..." });
+
+  let translatedText: string;
+
+  const ttsPromise = processTTSQueue();
+
+  try {
+    translatedText = await translateText(sourceText, targetLanguage, (progress) => {
+      sendSSE(res, { step: 'translating_progress', data: { progress } });
+    }, {
+      onProviderSwitch: (from, to) => {
+        console.log(`[Pipeline] Provider switch: ${from} → ${to}`);
+        sendSSE(res, { step: 'translating_provider_switch', data: { from, to } });
+      },
+      onChunkTranslated: (index, text, total) => {
+        totalTranslationChunks = total;
+        translatedChunkMap.set(index, text);
+        // Wake up TTS queue
+        if (ttsResolve) ttsResolve();
+      },
+    });
+    translationComplete = true;
+    if (ttsResolve) ttsResolve();
+  } catch (error: any) {
+    if (error instanceof PartialTranslationError && error.partialText) {
+      translatedText = error.partialText;
+      console.log(`[Pipeline] Partial translation: ${error.completedChunks}/${error.totalChunks} chunks`);
+      sendSSE(res, {
+        step: 'translating_partial',
+        data: {
+          translatedText: error.partialText,
+          completedChunks: error.completedChunks,
+          totalChunks: error.totalChunks,
+          message: error.message,
+        }
+      });
+      translationComplete = true;
+      if (ttsResolve) ttsResolve();
+    } else {
+      translationError = error;
+      if (ttsResolve) ttsResolve();
+      await ttsPromise;
+      throw error;
+    }
+  }
+
+  console.log(`[Pipeline] Translation done: ${translatedText.length} chars`);
+  sendSSE(res, { step: 'translation_done', data: { translatedText } });
+
+  // Wait for remaining TTS to finish
+  await ttsPromise;
+
+  console.log(`[Pipeline] TTS done: ${ttsChunkFileCount} audio chunks generated`);
+
+  // Write final concatenated audio
+  const finalFileName = `${filePrefix}_${targetLanguage}_${timestamp}.mp3`;
+  const finalPath = path.join(outputDir, finalFileName);
+  fs.writeFileSync(finalPath, Buffer.concat(audioBuffers));
+  const audioUrl = `/api/audio/${finalFileName}`;
+
+  return { translatedText, audioUrl };
+}
+
 // Shared: podcast pipeline (generate script → TTS)
 async function podcastPipeline(
   res: express.Response,
@@ -216,47 +353,49 @@ app.post('/api/process', requireAuth, requireQuota, async (req, res) => {
     cleanupAudioFile(audioPath);
     audioPath = null;
 
-    // Step 3: Translate (with auto-fallback and partial results)
-    sendSSE(res, { step: 'translating', message: 'Traduction en cours...' });
+    // Step 3+4: Translate and generate audio
     let translatedText: string;
-
-    try {
-      translatedText = await translateText(fullTranscript, targetLanguage, (progress) => {
-        sendSSE(res, { step: 'translating_progress', data: { progress } });
-      }, {
-        onProviderSwitch: (from, to) => {
-          console.log(`[Process] Provider switch: ${from} → ${to}`);
-          sendSSE(res, { step: 'translating_provider_switch', data: { from, to } });
-        },
-      });
-    } catch (error: any) {
-      if (error instanceof PartialTranslationError && error.partialText) {
-        translatedText = error.partialText;
-        console.log(`[Process] Partial translation: ${error.completedChunks}/${error.totalChunks} chunks`);
-        sendSSE(res, {
-          step: 'translating_partial',
-          data: {
-            translatedText: error.partialText,
-            completedChunks: error.completedChunks,
-            totalChunks: error.totalChunks,
-            message: error.message,
-          }
-        });
-      } else {
-        throw error;
-      }
-    }
-
-    console.log(`[Process] Translation done: ${translatedText.length} chars`);
-    sendSSE(res, { step: 'translation_done', data: { translatedText } });
-
-    // Step 4: TTS (standard or podcast mode)
     let audioUrl: string;
 
     if (podcastMode) {
+      // Podcast mode: translate first, then generate script + audio
+      sendSSE(res, { step: 'translating', message: 'Traduction en cours...' });
+
+      try {
+        translatedText = await translateText(fullTranscript, targetLanguage, (progress) => {
+          sendSSE(res, { step: 'translating_progress', data: { progress } });
+        }, {
+          onProviderSwitch: (from, to) => {
+            console.log(`[Process] Provider switch: ${from} → ${to}`);
+            sendSSE(res, { step: 'translating_provider_switch', data: { from, to } });
+          },
+        });
+      } catch (error: any) {
+        if (error instanceof PartialTranslationError && error.partialText) {
+          translatedText = error.partialText;
+          console.log(`[Process] Partial translation: ${error.completedChunks}/${error.totalChunks} chunks`);
+          sendSSE(res, {
+            step: 'translating_partial',
+            data: {
+              translatedText: error.partialText,
+              completedChunks: error.completedChunks,
+              totalChunks: error.totalChunks,
+              message: error.message,
+            }
+          });
+        } else {
+          throw error;
+        }
+      }
+
+      console.log(`[Process] Translation done: ${translatedText.length} chars`);
+      sendSSE(res, { step: 'translation_done', data: { translatedText } });
       audioUrl = await podcastPipeline(res, translatedText, videoId);
     } else {
-      audioUrl = await streamingTTS(res, translatedText, videoId, targetLanguage);
+      // Standard mode: pipeline translate + TTS in parallel
+      const result = await pipelinedTranslateAndTTS(res, fullTranscript, videoId, targetLanguage);
+      translatedText = result.translatedText;
+      audioUrl = result.audioUrl;
     }
 
     // Record usage
@@ -321,49 +460,50 @@ app.post('/api/process-file', requireAuth, requireQuota, upload.single('file'), 
     // Cleanup uploaded file
     cleanupAudioFile(file.path);
 
-    // Step 2: Translate (with auto-fallback and partial results)
-    sendSSE(res, { step: 'translating', message: 'Traduction en cours...' });
-
-    let translatedText: string;
-
-    try {
-      translatedText = await translateText(originalText, targetLanguage, (progress) => {
-        sendSSE(res, { step: 'translating_progress', data: { progress } });
-      }, {
-        onProviderSwitch: (from, to) => {
-          console.log(`[FileProcess] Provider switch: ${from} → ${to}`);
-          sendSSE(res, { step: 'translating_provider_switch', data: { from, to } });
-        },
-      });
-    } catch (error: any) {
-      if (error instanceof PartialTranslationError && error.partialText) {
-        translatedText = error.partialText;
-        console.log(`[FileProcess] Partial translation: ${error.completedChunks}/${error.totalChunks} chunks`);
-        sendSSE(res, {
-          step: 'translating_partial',
-          data: {
-            translatedText: error.partialText,
-            completedChunks: error.completedChunks,
-            totalChunks: error.totalChunks,
-            message: error.message,
-          }
-        });
-      } else {
-        throw error;
-      }
-    }
-
-    console.log(`[FileProcess] Translation done: ${translatedText.length} chars`);
-    sendSSE(res, { step: 'translation_done', data: { translatedText } });
-
-    // Step 3: TTS (standard or podcast mode)
+    // Step 2+3: Translate and generate audio
     const filePrefix = `doc_${Date.now()}`;
+    let translatedText: string;
     let audioUrl: string;
 
     if (podcastMode) {
+      // Podcast mode: translate first, then generate script + audio
+      sendSSE(res, { step: 'translating', message: 'Traduction en cours...' });
+
+      try {
+        translatedText = await translateText(originalText, targetLanguage, (progress) => {
+          sendSSE(res, { step: 'translating_progress', data: { progress } });
+        }, {
+          onProviderSwitch: (from, to) => {
+            console.log(`[FileProcess] Provider switch: ${from} → ${to}`);
+            sendSSE(res, { step: 'translating_provider_switch', data: { from, to } });
+          },
+        });
+      } catch (error: any) {
+        if (error instanceof PartialTranslationError && error.partialText) {
+          translatedText = error.partialText;
+          console.log(`[FileProcess] Partial translation: ${error.completedChunks}/${error.totalChunks} chunks`);
+          sendSSE(res, {
+            step: 'translating_partial',
+            data: {
+              translatedText: error.partialText,
+              completedChunks: error.completedChunks,
+              totalChunks: error.totalChunks,
+              message: error.message,
+            }
+          });
+        } else {
+          throw error;
+        }
+      }
+
+      console.log(`[FileProcess] Translation done: ${translatedText.length} chars`);
+      sendSSE(res, { step: 'translation_done', data: { translatedText } });
       audioUrl = await podcastPipeline(res, translatedText, filePrefix);
     } else {
-      audioUrl = await streamingTTS(res, translatedText, filePrefix, targetLanguage);
+      // Standard mode: pipeline translate + TTS in parallel
+      const result = await pipelinedTranslateAndTTS(res, originalText, filePrefix, targetLanguage);
+      translatedText = result.translatedText;
+      audioUrl = result.audioUrl;
     }
 
     // Record usage
