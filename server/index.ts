@@ -44,14 +44,24 @@ const videoOutputDir = path.join(__dirname, 'output', 'videos');
 if (!fs.existsSync(videoOutputDir)) fs.mkdirSync(videoOutputDir, { recursive: true });
 app.use('/api/video', express.static(videoOutputDir));
 
+// Serve uploaded media files (for local video preview)
+const uploadsDir = path.join(__dirname, 'output', 'uploads');
+if (!fs.existsSync(uploadsDir)) fs.mkdirSync(uploadsDir, { recursive: true });
+app.use('/api/uploads', express.static(uploadsDir));
+
 // File type detection
 const MEDIA_EXTENSIONS = new Set(['.mp4', '.mp3', '.wav', '.webm', '.ogg', '.m4a', '.flac', '.aac']);
+const VIDEO_EXTENSIONS = new Set(['.mp4', '.webm']);
 const DOCUMENT_EXTENSIONS = new Set(['.pdf', '.docx', '.doc', '.txt']);
 
 function getFileCategory(filename: string): 'media' | 'document' {
   const ext = path.extname(filename).toLowerCase();
   if (MEDIA_EXTENSIONS.has(ext)) return 'media';
   return 'document';
+}
+
+function isVideoFile(filename: string): boolean {
+  return VIDEO_EXTENSIONS.has(path.extname(filename).toLowerCase());
 }
 
 // SSE helper
@@ -462,6 +472,8 @@ app.post('/api/process-file', requireAuth, requireQuota, upload.single('file'), 
   try {
     let originalText: string;
 
+    let localVideoUrl: string | undefined;
+
     if (userTranscript) {
       // User provided their own transcription — skip extraction/transcription
       originalText = userTranscript;
@@ -470,8 +482,18 @@ app.post('/api/process-file', requireAuth, requireQuota, upload.single('file'), 
         step: 'extract_done',
         data: { text: originalText, charCount: originalText.length, source: 'user' }
       });
-      // Cleanup uploaded file (we don't need it for transcription)
-      cleanupAudioFile(file.path);
+
+      // If it's a video file, keep it for preview; otherwise cleanup
+      if (isVideoFile(file.originalname)) {
+        const ext = path.extname(file.originalname).toLowerCase();
+        const videoFileName = `upload_${Date.now()}${ext}`;
+        const videoDestPath = path.join(uploadsDir, videoFileName);
+        fs.renameSync(file.path, videoDestPath);
+        localVideoUrl = `/api/uploads/${videoFileName}`;
+        console.log(`[FileProcess] Kept video for preview: ${localVideoUrl}`);
+      } else {
+        cleanupAudioFile(file.path);
+      }
     } else if (fileCategory === 'media') {
       // Media file: transcribe with Whisper
       // Multer saves without extension — rename so the API can detect the file type
@@ -487,7 +509,17 @@ app.post('/api/process-file', requireAuth, requireQuota, upload.single('file'), 
         step: 'transcript_done',
         data: { transcript: originalText, segmentCount: segments.length }
       });
-      cleanupAudioFile(renamedPath);
+
+      // If it's a video file, keep it for preview; otherwise cleanup
+      if (isVideoFile(file.originalname)) {
+        const videoFileName = `upload_${Date.now()}${ext}`;
+        const videoDestPath = path.join(uploadsDir, videoFileName);
+        fs.renameSync(renamedPath, videoDestPath);
+        localVideoUrl = `/api/uploads/${videoFileName}`;
+        console.log(`[FileProcess] Kept video for preview: ${localVideoUrl}`);
+      } else {
+        cleanupAudioFile(renamedPath);
+      }
     } else {
       // Document: extract text
       sendSSE(res, { step: 'extract', message: 'Extraction du texte du document...' });
@@ -566,7 +598,7 @@ app.post('/api/process-file', requireAuth, requireQuota, upload.single('file'), 
 
     sendSSE(res, {
       step: 'done',
-      data: { audioUrl, translatedText, transcript: originalText, podcastMode }
+      data: { audioUrl, translatedText, transcript: originalText, podcastMode, localVideoUrl }
     });
 
   } catch (error: any) {
@@ -663,6 +695,46 @@ app.post('/api/merge-video', requireAuth, async (req, res) => {
   } catch (error: any) {
     console.error('[Merge] Error:', error.message);
     if (videoPath) cleanupAudioFile(videoPath);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ===== Merge local video + translated audio =====
+app.post('/api/merge-local-video', requireAuth, async (req, res) => {
+  const { localVideoUrl, audioUrl } = req.body;
+
+  if (!localVideoUrl || !audioUrl) {
+    return res.status(400).json({ error: 'localVideoUrl et audioUrl requis' });
+  }
+
+  const videoFileName = path.basename(localVideoUrl);
+  const videoPath = path.join(uploadsDir, videoFileName);
+  const audioFileName = path.basename(audioUrl);
+  const audioPath = path.join(outputDir, audioFileName);
+
+  if (!fs.existsSync(videoPath)) {
+    return res.status(404).json({ error: 'Fichier vidéo non trouvé' });
+  }
+  if (!fs.existsSync(audioPath)) {
+    return res.status(404).json({ error: 'Fichier audio non trouvé' });
+  }
+
+  try {
+    const mergedFileName = `local_translated_${Date.now()}.mp4`;
+    const mergedPath = path.join(videoOutputDir, mergedFileName);
+
+    console.log(`[MergeLocal] Merging ${videoFileName} + ${audioFileName}...`);
+    await mergeVideoAudio(videoPath, audioPath, mergedPath);
+
+    const stats = fs.statSync(mergedPath);
+    console.log(`[MergeLocal] Done: ${mergedFileName} (${(stats.size / 1024 / 1024).toFixed(1)}MB)`);
+
+    res.json({
+      videoUrl: `/api/video/${mergedFileName}`,
+      fileSize: `${(stats.size / 1024 / 1024).toFixed(1)}MB`,
+    });
+  } catch (error: any) {
+    console.error('[MergeLocal] Error:', error.message);
     res.status(500).json({ error: error.message });
   }
 });

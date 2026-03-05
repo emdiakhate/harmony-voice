@@ -25,6 +25,7 @@ import FileDropZone from "@/components/FileDropZone";
 import LanguageSelector from "@/components/LanguageSelector";
 import ResultsPanel from "@/components/ResultsPanel";
 import YouTubePlayer from "@/components/YouTubePlayer";
+import LocalVideoPlayer from "@/components/LocalVideoPlayer";
 import AudioPlayer from "@/components/AudioPlayer";
 import SaveDialog from "@/components/SaveDialog";
 import UserMenu from "@/components/UserMenu";
@@ -113,6 +114,9 @@ const Index = () => {
   // Save dialog
   const [showSaveDialog, setShowSaveDialog] = useState(false);
 
+  // Local video preview (uploaded video files)
+  const [localVideoUrl, setLocalVideoUrl] = useState("");
+
   // Transcript-only mode: user provides their own transcript (already in target language)
   const [userTranscript, setUserTranscript] = useState("");
   const [skipTranslation, setSkipTranslation] = useState(false);
@@ -138,6 +142,7 @@ const Index = () => {
     setVideoId("");
     setPodcastScript("");
     setShowSaveDialog(false);
+    setLocalVideoUrl("");
 
     // Build steps depending on mode
     if (inputMode === "url") {
@@ -372,6 +377,7 @@ const Index = () => {
         setAudioUrl(data.data.audioUrl);
         setIsTtsStreaming(false);
         if (data.data.videoId) setVideoId(data.data.videoId);
+        if (data.data.localVideoUrl) setLocalVideoUrl(data.data.localVideoUrl);
         if (data.data.translatedText) setTranslation(data.data.translatedText);
         if (data.data.transcript) setTranscription(data.data.transcript);
         setSteps((prev) => prev.map((s) => ({ ...s, status: "done" })));
@@ -400,17 +406,30 @@ const Index = () => {
   };
 
   const handleDownloadVideo = async () => {
-    if (!videoId || !audioUrl) return;
+    if (!audioUrl) return;
+    if (!videoId && !localVideoUrl) return;
 
     setIsDownloadingVideo(true);
-    toast.info("Telechargement et fusion de la video en cours...");
+    toast.info("Fusion video + audio traduit en cours...");
 
     try {
-      const response = await fetch("/api/merge-video", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ videoId, audioUrl }),
-      });
+      let response: Response;
+
+      if (localVideoUrl) {
+        // Local uploaded video
+        response = await fetch("/api/merge-local-video", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ localVideoUrl, audioUrl }),
+        });
+      } else {
+        // YouTube video
+        response = await fetch("/api/merge-video", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ videoId, audioUrl }),
+        });
+      }
 
       const result = await response.json();
 
@@ -420,7 +439,9 @@ const Index = () => {
 
       const a = document.createElement("a");
       a.href = result.videoUrl;
-      a.download = `${videoId}_traduit.mp4`;
+      a.download = localVideoUrl
+        ? `video_traduite_${Date.now()}.mp4`
+        : `${videoId}_traduit.mp4`;
       a.click();
 
       toast.success(`Video traduite prete (${result.fileSize})`);
@@ -765,7 +786,7 @@ const Index = () => {
           )}
         </AnimatePresence>
 
-        {/* Video + Audio Section (YouTube mode) */}
+        {/* Video Player: YouTube or Local */}
         <AnimatePresence>
           {displayVideoId && (
             <motion.section
@@ -778,9 +799,24 @@ const Index = () => {
           )}
         </AnimatePresence>
 
-        {/* Audio Player (both modes) */}
         <AnimatePresence>
-          {showAudioPlayer && (
+          {localVideoUrl && (
+            <motion.section
+              initial={{ opacity: 0, y: 20 }}
+              animate={{ opacity: 1, y: 0 }}
+              className="space-y-4"
+            >
+              <LocalVideoPlayer
+                videoUrl={localVideoUrl}
+                translatedAudioUrl={audioUrl || undefined}
+              />
+            </motion.section>
+          )}
+        </AnimatePresence>
+
+        {/* Audio Player (show only when no local video — local video has built-in sync) */}
+        <AnimatePresence>
+          {showAudioPlayer && !localVideoUrl && (
             <motion.section
               initial={{ opacity: 0, y: 20 }}
               animate={{ opacity: 1, y: 0 }}
@@ -792,19 +828,25 @@ const Index = () => {
                 isStreaming={isTtsStreaming}
                 title="Audio traduit"
               />
+            </motion.section>
+          )}
+        </AnimatePresence>
 
-              {/* Save/Download button */}
-              {audioUrl && (
-                <div className="flex gap-3 flex-wrap">
-                  <button
-                    onClick={() => setShowSaveDialog(true)}
-                    className="flex-1 min-w-[200px] py-3 rounded-xl bg-primary text-primary-foreground font-medium text-sm hover:opacity-90 transition-all flex items-center justify-center gap-2"
-                  >
-                    <BookmarkPlus className="w-4 h-4" />
-                    Enregistrer / Telecharger
-                  </button>
-                </div>
-              )}
+        {/* Save/Download button */}
+        <AnimatePresence>
+          {audioUrl && !isProcessing && (
+            <motion.section
+              initial={{ opacity: 0, y: 20 }}
+              animate={{ opacity: 1, y: 0 }}
+              className="flex gap-3 flex-wrap"
+            >
+              <button
+                onClick={() => setShowSaveDialog(true)}
+                className="flex-1 min-w-[200px] py-3 rounded-xl bg-primary text-primary-foreground font-medium text-sm hover:opacity-90 transition-all flex items-center justify-center gap-2"
+              >
+                <BookmarkPlus className="w-4 h-4" />
+                Enregistrer / Telecharger
+              </button>
             </motion.section>
           )}
         </AnimatePresence>
@@ -865,7 +907,7 @@ const Index = () => {
         transcription={transcription}
         translation={translation}
         targetLanguage={targetLang}
-        onDownloadVideo={videoId ? handleDownloadVideo : undefined}
+        onDownloadVideo={(videoId || localVideoUrl) ? handleDownloadVideo : undefined}
         isDownloadingVideo={isDownloadingVideo}
       />
     </div>
