@@ -28,10 +28,10 @@ app.use(express.json());
 // Clerk auth middleware (noop if CLERK_SECRET_KEY not set)
 app.use(createAuthMiddleware());
 
-// Multer for file uploads (50MB limit)
+// Multer for file uploads (200MB limit for video/audio)
 const upload = multer({
   dest: path.join(os.tmpdir(), 'harmony-voice-uploads'),
-  limits: { fileSize: 50 * 1024 * 1024 },
+  limits: { fileSize: 200 * 1024 * 1024 },
 });
 
 // Serve generated audio files
@@ -43,6 +43,16 @@ app.use('/api/audio', express.static(outputDir));
 const videoOutputDir = path.join(__dirname, 'output', 'videos');
 if (!fs.existsSync(videoOutputDir)) fs.mkdirSync(videoOutputDir, { recursive: true });
 app.use('/api/video', express.static(videoOutputDir));
+
+// File type detection
+const MEDIA_EXTENSIONS = new Set(['.mp4', '.mp3', '.wav', '.webm', '.ogg', '.m4a', '.flac', '.aac']);
+const DOCUMENT_EXTENSIONS = new Set(['.pdf', '.docx', '.doc', '.txt']);
+
+function getFileCategory(filename: string): 'media' | 'document' {
+  const ext = path.extname(filename).toLowerCase();
+  if (MEDIA_EXTENSIONS.has(ext)) return 'media';
+  return 'document';
+}
 
 // SSE helper
 function sendSSE(res: express.Response, data: any) {
@@ -420,7 +430,7 @@ app.post('/api/process', requireAuth, requireQuota, async (req, res) => {
   res.end();
 });
 
-// ===== File processing (PDF/DOCX/TXT → translate → TTS) =====
+// ===== File processing (PDF/DOCX/TXT/Video/Audio → translate → TTS) =====
 app.post('/api/process-file', requireAuth, requireQuota, upload.single('file'), async (req, res) => {
   const user = (req as any).dbUser;
 
@@ -433,6 +443,8 @@ app.post('/api/process-file', requireAuth, requireQuota, upload.single('file'), 
   const file = req.file;
   const targetLanguage = req.body?.targetLanguage || 'fr';
   const podcastMode = req.body?.podcastMode === 'true';
+  const userTranscript = req.body?.userTranscript?.trim() || '';
+  const skipTranslation = req.body?.skipTranslation === 'true';
 
   if (!file) {
     sendSSE(res, { step: 'error', message: 'Aucun fichier reçu.' });
@@ -445,27 +457,60 @@ app.post('/api/process-file', requireAuth, requireQuota, upload.single('file'), 
     return res.end();
   }
 
+  const fileCategory = getFileCategory(file.originalname);
+
   try {
-    // Step 1: Extract text from document
-    sendSSE(res, { step: 'extract', message: 'Extraction du texte du document...' });
+    let originalText: string;
 
-    const originalText = await extractTextFromFile(file.path, file.originalname);
+    if (userTranscript) {
+      // User provided their own transcription — skip extraction/transcription
+      originalText = userTranscript;
+      console.log(`[FileProcess] User-provided transcript: ${originalText.length} chars`);
+      sendSSE(res, {
+        step: 'extract_done',
+        data: { text: originalText, charCount: originalText.length, source: 'user' }
+      });
+      // Cleanup uploaded file (we don't need it for transcription)
+      cleanupAudioFile(file.path);
+    } else if (fileCategory === 'media') {
+      // Media file: transcribe with Whisper
+      sendSSE(res, { step: 'transcript', message: 'Transcription audio/vidéo avec Whisper IA...' });
+      const { text: transcript, segments } = await transcribeAudio(file.path);
+      originalText = transcript;
+      console.log(`[FileProcess] Transcribed media: ${segments.length} segments, ${originalText.length} chars from ${file.originalname}`);
+      sendSSE(res, {
+        step: 'transcript_done',
+        data: { transcript: originalText, segmentCount: segments.length }
+      });
+      cleanupAudioFile(file.path);
+    } else {
+      // Document: extract text
+      sendSSE(res, { step: 'extract', message: 'Extraction du texte du document...' });
+      originalText = await extractTextFromFile(file.path, file.originalname);
+      console.log(`[FileProcess] Extracted ${originalText.length} chars from ${file.originalname}`);
+      sendSSE(res, {
+        step: 'extract_done',
+        data: { text: originalText, charCount: originalText.length }
+      });
+      cleanupAudioFile(file.path);
+    }
 
-    console.log(`[FileProcess] Extracted ${originalText.length} chars from ${file.originalname}`);
-    sendSSE(res, {
-      step: 'extract_done',
-      data: { text: originalText, charCount: originalText.length }
-    });
-
-    // Cleanup uploaded file
-    cleanupAudioFile(file.path);
-
-    // Step 2+3: Translate and generate audio
-    const filePrefix = `doc_${Date.now()}`;
+    const filePrefix = `file_${Date.now()}`;
     let translatedText: string;
     let audioUrl: string;
 
-    if (podcastMode) {
+    if (skipTranslation) {
+      // User provided transcript already in target language — skip translation, just TTS
+      translatedText = originalText;
+      console.log(`[FileProcess] Skip translation, direct TTS: ${translatedText.length} chars`);
+      sendSSE(res, { step: 'translation_done', data: { translatedText, skipped: true } });
+
+      if (podcastMode) {
+        audioUrl = await podcastPipeline(res, translatedText, filePrefix);
+      } else {
+        audioUrl = await streamingTTS(res, translatedText, filePrefix, targetLanguage);
+      }
+    } else if (podcastMode) {
       // Podcast mode: translate first, then generate script + audio
       sendSSE(res, { step: 'translating', message: 'Traduction en cours...' });
 
@@ -511,7 +556,7 @@ app.post('/api/process-file', requireAuth, requireQuota, upload.single('file'), 
     await recordUsage(user.id, podcastMode ? 'podcast' : 'tts', {
       durationSeconds: estimatedDuration,
       inputChars: originalText.length,
-      metadata: JSON.stringify({ fileName: file.originalname, targetLanguage, podcastMode }),
+      metadata: JSON.stringify({ fileName: file.originalname, fileCategory, targetLanguage, podcastMode, skipTranslation }),
     });
 
     sendSSE(res, {
