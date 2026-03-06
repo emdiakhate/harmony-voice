@@ -9,7 +9,7 @@ import os from 'os';
 import { downloadYouTubeAudio, downloadYouTubeVideo, mergeVideoAudio, extractVideoId, cleanupAudioFile } from './services/youtube.js';
 import { transcribeAudio } from './services/transcriber.js';
 import { translateText, PartialTranslationError, detectLanguage } from './services/translator.js';
-import { splitForTTS, generateSpeechChunk } from './services/tts.js';
+import { splitForTTS, generateSpeechChunk, setEdgeTTSLang } from './services/tts.js';
 import { extractTextFromFile } from './services/document-parser.js';
 import { generatePodcastScript } from './services/podcast-generator.js';
 import { generatePodcastAudio } from './services/podcast-tts.js';
@@ -77,6 +77,7 @@ async function streamingTTS(
   targetLanguage: string,
 ): Promise<string> {
   sendSSE(res, { step: 'tts', message: "Génération de l'audio traduit..." });
+  setEdgeTTSLang(targetLanguage);
 
   const ttsChunks = splitForTTS(translatedText);
   const audioBuffers: Buffer[] = [];
@@ -221,6 +222,7 @@ async function pipelinedTranslateAndTTS(
   // Start translation with chunk callback
   sendSSE(res, { step: 'translating', message: 'Traduction en cours...' });
   sendSSE(res, { step: 'tts', message: "Génération audio en parallèle..." });
+  setEdgeTTSLang(targetLanguage);
 
   let translatedText: string;
 
@@ -955,6 +957,6 @@ app.listen(PORT, () => {
   console.log(`ElevenLabs API key: ${process.env.ELEVENLABS_API_KEY ? 'configured (TTS fallback)' : 'not set'}`);
   console.log(`Google API key: ${process.env.GOOGLE_API_KEY ? 'configured (Gemini TTS podcast)' : 'not set'}`);
   console.log(`[Priority] Translation/LLM: Groq > OpenRouter > OpenAI`);
-  console.log(`[Priority] TTS: ElevenLabs > OpenAI | Podcast TTS: Gemini > ElevenLabs > OpenAI`);
+  console.log(`[Priority] TTS: ElevenLabs > OpenAI > Gemini > Edge TTS (free) | Podcast TTS: Gemini > ElevenLabs > OpenAI`);
   console.log(`[Priority] Whisper: Groq > OpenAI`);
 });

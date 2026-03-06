@@ -1,5 +1,6 @@
 import OpenAI from 'openai';
 import { ElevenLabsClient } from '@elevenlabs/elevenlabs-js';
+import { MsEdgeTTS, OUTPUT_FORMAT } from 'msedge-tts';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
@@ -136,6 +137,14 @@ export async function generateSpeechChunk(text: string): Promise<Buffer> {
     }
   }
 
+  // 4. Ultimate fallback: Edge TTS (free, no API key needed)
+  try {
+    console.log('[TTS] Using Edge TTS fallback (free, fr-FR-DeniseNeural)');
+    return await generateWithEdgeTTS(text);
+  } catch (err: any) {
+    console.error(`[TTS] Edge TTS failed: ${err.message}`);
+  }
+
   throw new Error('Aucun provider TTS disponible. Tous les providers ont échoué ou sont désactivés.');
 }
 
@@ -187,6 +196,54 @@ async function generateWithGemini(text: string, apiKey: string): Promise<Buffer>
   // Gemini returns raw PCM (s16le, 24kHz, mono) — convert to MP3
   const pcmBuffer = Buffer.from(audioContent, 'base64');
   return pcmToMp3(pcmBuffer);
+}
+
+// Edge TTS voice mapping per language
+const EDGE_TTS_VOICES: Record<string, string> = {
+  fr: 'fr-FR-DeniseNeural',
+  en: 'en-US-JennyNeural',
+  es: 'es-ES-ElviraNeural',
+  de: 'de-DE-KatjaNeural',
+  pt: 'pt-BR-FranciscaNeural',
+  it: 'it-IT-ElsaNeural',
+  ar: 'ar-SA-ZariyahNeural',
+  zh: 'zh-CN-XiaoxiaoNeural',
+  ja: 'ja-JP-NanamiNeural',
+  ko: 'ko-KR-SunHiNeural',
+  ru: 'ru-RU-SvetlanaNeural',
+  hi: 'hi-IN-SwaraNeural',
+};
+
+let edgeTTSLang = 'fr'; // set by caller via setEdgeTTSLang
+
+export function setEdgeTTSLang(lang: string) {
+  edgeTTSLang = lang;
+}
+
+/**
+ * Generate speech with Microsoft Edge TTS (free, no API key).
+ * Returns MP3 buffer.
+ */
+async function generateWithEdgeTTS(text: string): Promise<Buffer> {
+  const voice = EDGE_TTS_VOICES[edgeTTSLang] || EDGE_TTS_VOICES.fr;
+  const tts = new MsEdgeTTS();
+  await tts.setMetadata(voice, OUTPUT_FORMAT.AUDIO_24KHZ_96KBITRATE_MONO_MP3);
+
+  const { audioStream } = tts.toStream(text);
+
+  const chunks: Buffer[] = [];
+  for await (const chunk of audioStream) {
+    chunks.push(Buffer.from(chunk));
+  }
+
+  tts.close();
+
+  const buffer = Buffer.concat(chunks);
+  if (buffer.length === 0) {
+    throw new Error('Edge TTS returned empty audio');
+  }
+
+  return buffer;
 }
 
 /**

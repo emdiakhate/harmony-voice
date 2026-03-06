@@ -47,6 +47,12 @@ export async function requireAuth(req: Request, res: Response, next: NextFunctio
  */
 export async function requireQuota(req: Request, res: Response, next: NextFunction) {
   try {
+    // Dev mode — skip quota entirely
+    if (!process.env.CLERK_SECRET_KEY) {
+      (req as any).quota = { allowed: true, used: 0, limit: Infinity, remaining: Infinity };
+      return next();
+    }
+
     const user = (req as any).dbUser;
     if (!user) {
       return res.status(401).json({ error: 'Non authentifié' });

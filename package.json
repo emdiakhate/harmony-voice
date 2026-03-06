@@ -68,6 +68,7 @@
     "input-otp": "^1.4.2",
     "lucide-react": "^0.462.0",
     "mammoth": "^1.11.0",
+    "msedge-tts": "^2.0.4",
     "multer": "^2.0.2",
     "next-themes": "^0.3.0",
     "openai": "^6.24.0",
