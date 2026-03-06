@@ -9,6 +9,10 @@ import {
   Download,
   Merge,
   X,
+  Gauge,
+  Volume2,
+  Timer,
+  Settings,
 } from "lucide-react";
 import { toast } from "sonner";
 
@@ -26,6 +30,14 @@ function formatSize(bytes: number): string {
 
 const AUDIO_ACCEPT = ".mp3,.wav,.ogg,.m4a,.flac,.aac,.webm";
 
+const SPEED_PRESETS = [
+  { label: "0.75x", value: 0.75 },
+  { label: "1x", value: 1.0 },
+  { label: "1.25x", value: 1.25 },
+  { label: "1.5x", value: 1.5 },
+  { label: "2x", value: 2.0 },
+];
+
 const AudioCombiner = () => {
   const [files, setFiles] = useState<AudioFile[]>([]);
   const [isCombining, setIsCombining] = useState(false);
@@ -33,10 +45,21 @@ const AudioCombiner = () => {
   const [resultSize, setResultSize] = useState("");
   const fileInputRef = useRef<HTMLInputElement>(null);
 
+  // ffmpeg options
+  const [showOptions, setShowOptions] = useState(false);
+  const [speed, setSpeed] = useState(1.0);
+  const [normalize, setNormalize] = useState(false);
+  const [silenceGap, setSilenceGap] = useState(0);
+
   const addFiles = useCallback((newFiles: FileList | File[]) => {
     const audioFiles: AudioFile[] = [];
     for (const file of Array.from(newFiles)) {
-      if (!file.type.startsWith("audio/") && !AUDIO_ACCEPT.split(",").some(ext => file.name.toLowerCase().endsWith(ext))) {
+      if (
+        !file.type.startsWith("audio/") &&
+        !AUDIO_ACCEPT.split(",").some((ext) =>
+          file.name.toLowerCase().endsWith(ext)
+        )
+      ) {
         toast.error(`${file.name} n'est pas un fichier audio`);
         continue;
       }
@@ -85,6 +108,9 @@ const AudioCombiner = () => {
       for (const audioFile of files) {
         formData.append("files", audioFile.file);
       }
+      formData.append("speed", String(speed));
+      formData.append("normalize", String(normalize));
+      formData.append("silenceGap", String(silenceGap));
 
       const response = await fetch("/api/combine-audio", {
         method: "POST",
@@ -117,6 +143,8 @@ const AudioCombiner = () => {
     a.download = `audio_combine_${Date.now()}.mp3`;
     a.click();
   };
+
+  const hasCustomOptions = speed !== 1.0 || normalize || silenceGap > 0;
 
   return (
     <div className="space-y-6">
@@ -216,6 +244,117 @@ const AudioCombiner = () => {
               Ajouter d'autres fichiers
             </button>
 
+            {/* Options toggle */}
+            <button
+              onClick={() => setShowOptions(!showOptions)}
+              className={`w-full py-2.5 rounded-lg text-sm font-medium transition-all flex items-center justify-center gap-2 ${
+                showOptions || hasCustomOptions
+                  ? "bg-primary/10 text-primary border border-primary/20"
+                  : "bg-muted text-muted-foreground hover:text-foreground"
+              }`}
+            >
+              <Settings className="w-4 h-4" />
+              Options avancees
+              {hasCustomOptions && !showOptions && (
+                <span className="text-xs bg-primary text-primary-foreground px-1.5 py-0.5 rounded-full">
+                  actif
+                </span>
+              )}
+            </button>
+
+            {/* Options panel */}
+            <AnimatePresence>
+              {showOptions && (
+                <motion.div
+                  initial={{ opacity: 0, height: 0 }}
+                  animate={{ opacity: 1, height: "auto" }}
+                  exit={{ opacity: 0, height: 0 }}
+                  className="space-y-4 p-4 rounded-xl bg-muted/50 border border-border/50"
+                >
+                  {/* Speed control */}
+                  <div className="space-y-2">
+                    <div className="flex items-center gap-2">
+                      <Gauge className="w-4 h-4 text-muted-foreground" />
+                      <span className="text-sm font-medium text-foreground">
+                        Vitesse de lecture
+                      </span>
+                      <span className="text-xs text-primary ml-auto font-medium">
+                        {speed}x
+                      </span>
+                    </div>
+                    <div className="flex gap-1.5">
+                      {SPEED_PRESETS.map((preset) => (
+                        <button
+                          key={preset.value}
+                          onClick={() => setSpeed(preset.value)}
+                          className={`flex-1 py-1.5 rounded-md text-xs font-medium transition-all ${
+                            speed === preset.value
+                              ? "bg-primary text-primary-foreground"
+                              : "bg-background border border-border text-muted-foreground hover:text-foreground"
+                          }`}
+                        >
+                          {preset.label}
+                        </button>
+                      ))}
+                    </div>
+                    <p className="text-xs text-muted-foreground">
+                      Accelerer pour reviser vite, ralentir pour mieux comprendre
+                    </p>
+                  </div>
+
+                  {/* Volume normalization */}
+                  <div className="space-y-2">
+                    <label className="flex items-center gap-2 cursor-pointer">
+                      <input
+                        type="checkbox"
+                        checked={normalize}
+                        onChange={(e) => setNormalize(e.target.checked)}
+                        className="w-4 h-4 rounded border-border text-primary focus:ring-primary/50"
+                      />
+                      <Volume2 className="w-4 h-4 text-muted-foreground" />
+                      <span className="text-sm font-medium text-foreground">
+                        Normaliser le volume
+                      </span>
+                    </label>
+                    <p className="text-xs text-muted-foreground ml-6">
+                      Egalise le volume entre tous les fichiers pour une ecoute uniforme
+                    </p>
+                  </div>
+
+                  {/* Silence gap */}
+                  <div className="space-y-2">
+                    <div className="flex items-center gap-2">
+                      <Timer className="w-4 h-4 text-muted-foreground" />
+                      <span className="text-sm font-medium text-foreground">
+                        Silence entre les fichiers
+                      </span>
+                      <span className="text-xs text-primary ml-auto font-medium">
+                        {silenceGap === 0 ? "Aucun" : `${silenceGap}s`}
+                      </span>
+                    </div>
+                    <input
+                      type="range"
+                      min={0}
+                      max={5}
+                      step={0.5}
+                      value={silenceGap}
+                      onChange={(e) =>
+                        setSilenceGap(parseFloat(e.target.value))
+                      }
+                      className="w-full accent-primary"
+                    />
+                    <div className="flex justify-between text-xs text-muted-foreground">
+                      <span>0s</span>
+                      <span>5s</span>
+                    </div>
+                    <p className="text-xs text-muted-foreground">
+                      Insere un silence entre chaque audio pour separer les chapitres
+                    </p>
+                  </div>
+                </motion.div>
+              )}
+            </AnimatePresence>
+
             {/* Combine button */}
             <button
               onClick={handleCombine}
@@ -231,6 +370,17 @@ const AudioCombiner = () => {
                 <>
                   <Merge className="w-5 h-5" />
                   Combiner {files.length} audio{files.length > 1 ? "s" : ""}
+                  {hasCustomOptions && (
+                    <span className="text-xs opacity-75">
+                      ({[
+                        speed !== 1.0 && `${speed}x`,
+                        normalize && "normalise",
+                        silenceGap > 0 && `${silenceGap}s silence`,
+                      ]
+                        .filter(Boolean)
+                        .join(", ")})
+                    </span>
+                  )}
                 </>
               )}
             </button>

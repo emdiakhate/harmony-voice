@@ -31,6 +31,7 @@ import AudioPlayer from "@/components/AudioPlayer";
 import SaveDialog from "@/components/SaveDialog";
 import UserMenu from "@/components/UserMenu";
 import AudioCombiner from "@/components/AudioCombiner";
+import PdfSplitter from "@/components/PdfSplitter";
 import { toast } from "sonner";
 
 type InputMode = "file" | "url" | "combine";
@@ -747,6 +748,16 @@ const Index = () => {
                 acceptTypes="all"
                 disabled={isProcessing || waitingForNext}
               />
+
+              {/* PDF auto-split */}
+              {!isProcessing && !waitingForNext && (
+                <PdfSplitter
+                  onChunksReady={(chunks) => {
+                    setSelectedFiles((prev) => [...prev, ...chunks]);
+                  }}
+                  disabled={isProcessing}
+                />
+              )}
 
               {/* Transcript-only mode: show when a single file is selected */}
               {selectedFiles.length === 1 && (

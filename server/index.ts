@@ -16,6 +16,7 @@ import { generatePodcastAudio } from './services/podcast-tts.js';
 import { createAuthMiddleware, requireAuth, requireQuota, requirePodcastAccess } from './lib/auth.js';
 import { recordUsage, getMonthlyUsage, checkQuota, PLAN_LIMITS } from './lib/quota.js';
 import { prisma } from './lib/prisma.js';
+import { PDFDocument } from 'pdf-lib';
 
 config();
 
@@ -818,6 +819,73 @@ app.post('/api/merge-local-video', requireAuth, async (req, res) => {
   }
 });
 
+// ===== Split large PDF into chunks =====
+app.post('/api/split-pdf', requireAuth, upload.single('file'), async (req, res) => {
+  const file = req.file;
+  if (!file) {
+    return res.status(400).json({ error: 'Aucun fichier fourni.' });
+  }
+
+  const pagesPerChunk = Math.max(1, parseInt(req.body.pagesPerChunk || '12', 10));
+
+  try {
+    const pdfBytes = fs.readFileSync(file.path);
+    const pdfDoc = await PDFDocument.load(pdfBytes);
+    const totalPages = pdfDoc.getPageCount();
+
+    if (totalPages <= pagesPerChunk) {
+      // No need to split — return the original file as a single chunk
+      const chunkName = `chunk_1_p1-${totalPages}_${Date.now()}.pdf`;
+      const chunkPath = path.join(outputDir, chunkName);
+      fs.copyFileSync(file.path, chunkPath);
+      fs.unlinkSync(file.path);
+
+      return res.json({
+        totalPages,
+        chunks: [{
+          index: 0,
+          pages: `1-${totalPages}`,
+          url: `/api/audio/${chunkName}`,
+          fileName: chunkName,
+        }],
+      });
+    }
+
+    const chunks: { index: number; pages: string; url: string; fileName: string }[] = [];
+
+    for (let start = 0; start < totalPages; start += pagesPerChunk) {
+      const end = Math.min(start + pagesPerChunk, totalPages);
+      const chunkDoc = await PDFDocument.create();
+      const copiedPages = await chunkDoc.copyPages(pdfDoc, Array.from({ length: end - start }, (_, i) => start + i));
+      for (const page of copiedPages) {
+        chunkDoc.addPage(page);
+      }
+
+      const chunkBytes = await chunkDoc.save();
+      const chunkName = `chunk_${chunks.length + 1}_p${start + 1}-${end}_${Date.now()}.pdf`;
+      const chunkPath = path.join(outputDir, chunkName);
+      fs.writeFileSync(chunkPath, chunkBytes);
+
+      chunks.push({
+        index: chunks.length,
+        pages: `${start + 1}-${end}`,
+        url: `/api/audio/${chunkName}`,
+        fileName: chunkName,
+      });
+    }
+
+    fs.unlinkSync(file.path);
+
+    console.log(`[Split] ${totalPages} pages → ${chunks.length} chunks of ${pagesPerChunk} pages`);
+
+    res.json({ totalPages, pagesPerChunk, chunks });
+  } catch (error: any) {
+    console.error('[Split] Error:', error.message);
+    try { fs.unlinkSync(file.path); } catch {}
+    res.status(500).json({ error: error.message || 'Erreur lors du découpage PDF.' });
+  }
+});
+
 // ===== Combine multiple audio files =====
 app.post('/api/combine-audio', requireAuth, upload.array('files', 50), async (req, res) => {
   const files = req.files as Express.Multer.File[];
@@ -826,31 +894,83 @@ app.post('/api/combine-audio', requireAuth, upload.array('files', 50), async (re
     return res.status(400).json({ error: 'Au moins 2 fichiers audio requis.' });
   }
 
+  // Options from form data
+  const speed = parseFloat(req.body.speed || '1.0');
+  const normalize = req.body.normalize === 'true';
+  const silenceGap = parseFloat(req.body.silenceGap || '0');
+
   const tmpDir = path.join(os.tmpdir(), `harmony-combine-${Date.now()}`);
   fs.mkdirSync(tmpDir, { recursive: true });
 
   try {
+    const { execSync } = await import('child_process');
+
     // Create ffmpeg concat list file (demuxer approach for reliable concatenation)
     const listPath = path.join(tmpDir, 'list.txt');
     const entries: string[] = [];
+
+    // Generate silence file if needed
+    let silencePath = '';
+    if (silenceGap > 0) {
+      silencePath = path.join(tmpDir, 'silence.mp3');
+      execSync(
+        `ffmpeg -y -f lavfi -i anullsrc=r=44100:cl=stereo -t ${silenceGap} -acodec libmp3lame -ab 192k "${silencePath}"`,
+        { timeout: 10000, stdio: 'pipe' }
+      );
+    }
 
     for (let i = 0; i < files.length; i++) {
       const ext = path.extname(files[i].originalname).toLowerCase() || '.mp3';
       const safePath = path.join(tmpDir, `input_${i}${ext}`);
       fs.renameSync(files[i].path, safePath);
       entries.push(`file '${safePath.replace(/'/g, "'\\''")}'`);
+
+      // Add silence between files (not after the last one)
+      if (silenceGap > 0 && i < files.length - 1) {
+        entries.push(`file '${silencePath.replace(/'/g, "'\\''")}'`);
+      }
     }
 
     fs.writeFileSync(listPath, entries.join('\n'));
 
+    const concatPath = path.join(tmpDir, 'concat_raw.mp3');
     const outputPath = path.join(outputDir, `combined_${Date.now()}.mp3`);
 
-    // Use ffmpeg concat demuxer — re-encodes to ensure consistent format
-    const { execSync } = await import('child_process');
+    // Step 1: Concat all files
     execSync(
-      `ffmpeg -y -f concat -safe 0 -i "${listPath}" -acodec libmp3lame -ab 192k "${outputPath}"`,
-      { timeout: 120000, stdio: 'pipe' }
+      `ffmpeg -y -f concat -safe 0 -i "${listPath}" -acodec libmp3lame -ab 192k "${concatPath}"`,
+      { timeout: 300000, stdio: 'pipe' }
     );
+
+    // Step 2: Apply post-processing filters (speed, normalization)
+    const filters: string[] = [];
+    if (speed !== 1.0 && speed >= 0.5 && speed <= 3.0) {
+      // atempo only supports 0.5–2.0, chain for larger values
+      let remaining = speed;
+      const atempoChain: string[] = [];
+      while (remaining > 2.0) {
+        atempoChain.push('atempo=2.0');
+        remaining /= 2.0;
+      }
+      while (remaining < 0.5) {
+        atempoChain.push('atempo=0.5');
+        remaining /= 0.5;
+      }
+      atempoChain.push(`atempo=${remaining.toFixed(4)}`);
+      filters.push(...atempoChain);
+    }
+    if (normalize) {
+      filters.push('loudnorm=I=-16:TP=-1.5:LRA=11');
+    }
+
+    if (filters.length > 0) {
+      execSync(
+        `ffmpeg -y -i "${concatPath}" -af "${filters.join(',')}" -acodec libmp3lame -ab 192k "${outputPath}"`,
+        { timeout: 300000, stdio: 'pipe' }
+      );
+    } else {
+      fs.renameSync(concatPath, outputPath);
+    }
 
     // Cleanup temp files
     fs.rmSync(tmpDir, { recursive: true, force: true });
@@ -858,7 +978,11 @@ app.post('/api/combine-audio', requireAuth, upload.array('files', 50), async (re
     const stats = fs.statSync(outputPath);
     const fileName = path.basename(outputPath);
 
-    console.log(`[Combine] ${files.length} files → ${fileName} (${(stats.size / 1024 / 1024).toFixed(1)}MB)`);
+    const opts = [];
+    if (speed !== 1.0) opts.push(`speed=${speed}x`);
+    if (normalize) opts.push('normalized');
+    if (silenceGap > 0) opts.push(`silence=${silenceGap}s`);
+    console.log(`[Combine] ${files.length} files → ${fileName} (${(stats.size / 1024 / 1024).toFixed(1)}MB) ${opts.length ? `[${opts.join(', ')}]` : ''}`);
 
     res.json({
       audioUrl: `/api/audio/${fileName}`,
