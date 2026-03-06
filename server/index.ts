@@ -915,7 +915,7 @@ app.post('/api/combine-audio', requireAuth, upload.array('files', 50), async (re
       silencePath = path.join(tmpDir, 'silence.mp3');
       execSync(
         `ffmpeg -y -f lavfi -i anullsrc=r=44100:cl=stereo -t ${silenceGap} -acodec libmp3lame -ab 192k "${silencePath}"`,
-        { timeout: 10000, stdio: 'pipe' }
+        { timeout: 10000, stdio: 'ignore' }
       );
     }
 
@@ -929,7 +929,7 @@ app.post('/api/combine-audio', requireAuth, upload.array('files', 50), async (re
       // This prevents duration/speed issues when concatenating heterogeneous files
       execSync(
         `ffmpeg -y -i "${rawPath}" -ar 44100 -ac 2 -acodec libmp3lame -ab 192k "${safePath}"`,
-        { timeout: 120000, stdio: 'pipe' }
+        { timeout: 120000, stdio: 'ignore' }
       );
 
       entries.push(`file '${safePath.replace(/'/g, "'\\''")}'`);
@@ -948,7 +948,7 @@ app.post('/api/combine-audio', requireAuth, upload.array('files', 50), async (re
     // Step 1: Concat all files (all pre-normalized to same format, so -c copy is safe)
     execSync(
       `ffmpeg -y -f concat -safe 0 -i "${listPath}" -c copy "${concatPath}"`,
-      { timeout: 300000, stdio: 'pipe' }
+      { timeout: 300000, stdio: 'ignore' }
     );
 
     // Step 2: Apply post-processing filters (speed, normalization)
@@ -975,7 +975,7 @@ app.post('/api/combine-audio', requireAuth, upload.array('files', 50), async (re
     if (filters.length > 0) {
       execSync(
         `ffmpeg -y -i "${concatPath}" -af "${filters.join(',')}" -acodec libmp3lame -ab 192k "${outputPath}"`,
-        { timeout: 300000, stdio: 'pipe' }
+        { timeout: 300000, stdio: 'ignore' }
       );
     } else {
       fs.renameSync(concatPath, outputPath);
