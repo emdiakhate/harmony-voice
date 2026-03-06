@@ -16,7 +16,6 @@ import { generatePodcastAudio } from './services/podcast-tts.js';
 import { createAuthMiddleware, requireAuth, requireQuota, requirePodcastAccess } from './lib/auth.js';
 import { recordUsage, getMonthlyUsage, checkQuota, PLAN_LIMITS } from './lib/quota.js';
 import { prisma } from './lib/prisma.js';
-import { PDFDocument } from 'pdf-lib';
 
 config();
 
@@ -829,6 +828,7 @@ app.post('/api/split-pdf', requireAuth, upload.single('file'), async (req, res) 
   const pagesPerChunk = Math.max(1, parseInt(req.body.pagesPerChunk || '12', 10));
 
   try {
+    const { PDFDocument } = await import('pdf-lib');
     const pdfBytes = fs.readFileSync(file.path);
     const pdfDoc = await PDFDocument.load(pdfBytes);
     const totalPages = pdfDoc.getPageCount();
