@@ -222,28 +222,36 @@ export function setEdgeTTSLang(lang: string) {
 
 /**
  * Generate speech with Microsoft Edge TTS (free, no API key).
- * Returns MP3 buffer.
+ * Returns MP3 buffer. Uses toFile for reliability.
  */
 async function generateWithEdgeTTS(text: string): Promise<Buffer> {
   const voice = EDGE_TTS_VOICES[edgeTTSLang] || EDGE_TTS_VOICES.fr;
   const tts = new MsEdgeTTS();
   await tts.setMetadata(voice, OUTPUT_FORMAT.AUDIO_24KHZ_96KBITRATE_MONO_MP3);
 
-  const { audioStream } = tts.toStream(text);
+  const tmpDir = os.tmpdir();
+  const outputDir = path.join(tmpDir, 'edge-tts-output');
+  if (!fs.existsSync(outputDir)) fs.mkdirSync(outputDir, { recursive: true });
 
-  const chunks: Buffer[] = [];
-  for await (const chunk of audioStream) {
-    chunks.push(Buffer.from(chunk));
+  try {
+    const { audioFilePath } = await tts.toFile(outputDir, text);
+    const buffer = fs.readFileSync(audioFilePath);
+
+    // Cleanup temp file
+    try { fs.unlinkSync(audioFilePath); } catch {}
+
+    tts.close();
+
+    if (buffer.length === 0) {
+      throw new Error('Edge TTS returned empty audio');
+    }
+
+    console.log(`[TTS] Edge TTS generated ${(buffer.length / 1024).toFixed(1)}KB audio`);
+    return buffer;
+  } catch (err) {
+    tts.close();
+    throw err;
   }
-
-  tts.close();
-
-  const buffer = Buffer.concat(chunks);
-  if (buffer.length === 0) {
-    throw new Error('Edge TTS returned empty audio');
-  }
-
-  return buffer;
 }
 
 /**
