@@ -30,9 +30,10 @@ import LocalVideoPlayer from "@/components/LocalVideoPlayer";
 import AudioPlayer from "@/components/AudioPlayer";
 import SaveDialog from "@/components/SaveDialog";
 import UserMenu from "@/components/UserMenu";
+import AudioCombiner from "@/components/AudioCombiner";
 import { toast } from "sonner";
 
-type InputMode = "file" | "url";
+type InputMode = "file" | "url" | "combine";
 
 interface ProcessingStep {
   id: string;
@@ -717,7 +718,23 @@ const Index = () => {
               <Video className="w-4 h-4" />
               Lien YouTube
             </button>
+            <button
+              onClick={() => setInputMode("combine")}
+              className={`flex items-center gap-2 px-4 py-2.5 rounded-lg text-sm font-medium transition-all ${
+                inputMode === "combine"
+                  ? "bg-primary text-primary-foreground"
+                  : "bg-muted text-muted-foreground hover:text-foreground"
+              }`}
+            >
+              <Music className="w-4 h-4" />
+              Combiner Audios
+            </button>
           </div>
+
+          {/* Combine mode */}
+          {inputMode === "combine" ? (
+            <AudioCombiner />
+          ) : null}
 
           {/* File or URL input */}
           {inputMode === "file" ? (
@@ -785,69 +802,73 @@ const Index = () => {
           )}
 
           {/* Language Selectors */}
-          <div className="flex items-end gap-3">
-            <LanguageSelector
-              label="Langue source"
-              value={sourceLang}
-              onChange={setSourceLang}
-              showAuto
-            />
-            <button className="p-3 rounded-lg bg-muted text-muted-foreground hover:text-primary transition-colors mb-0.5">
-              <ArrowRightLeft className="w-5 h-5" />
-            </button>
-            <LanguageSelector
-              label="Langue cible"
-              value={targetLang}
-              onChange={setTargetLang}
-            />
-          </div>
+          {inputMode !== "combine" && (
+            <>
+              <div className="flex items-end gap-3">
+                <LanguageSelector
+                  label="Langue source"
+                  value={sourceLang}
+                  onChange={setSourceLang}
+                  showAuto
+                />
+                <button className="p-3 rounded-lg bg-muted text-muted-foreground hover:text-primary transition-colors mb-0.5">
+                  <ArrowRightLeft className="w-5 h-5" />
+                </button>
+                <LanguageSelector
+                  label="Langue cible"
+                  value={targetLang}
+                  onChange={setTargetLang}
+                />
+              </div>
 
-          {/* Podcast Mode Toggle */}
-          <div className="flex items-center gap-3">
-            <button
-              onClick={() => setPodcastMode(!podcastMode)}
-              disabled={isProcessing}
-              className={`flex items-center gap-2 px-4 py-2.5 rounded-lg text-sm font-medium transition-all ${
-                podcastMode
-                  ? "bg-primary text-primary-foreground"
-                  : "bg-muted text-muted-foreground hover:text-foreground"
-              } disabled:opacity-50`}
-            >
-              <Radio className="w-4 h-4" />
-              Mode Podcast
-            </button>
-            {podcastMode && (
-              <span className="text-xs text-muted-foreground">
-                Le contenu sera transforme en conversation podcast 2 speakers
-              </span>
-            )}
-          </div>
+              {/* Podcast Mode Toggle */}
+              <div className="flex items-center gap-3">
+                <button
+                  onClick={() => setPodcastMode(!podcastMode)}
+                  disabled={isProcessing}
+                  className={`flex items-center gap-2 px-4 py-2.5 rounded-lg text-sm font-medium transition-all ${
+                    podcastMode
+                      ? "bg-primary text-primary-foreground"
+                      : "bg-muted text-muted-foreground hover:text-foreground"
+                  } disabled:opacity-50`}
+                >
+                  <Radio className="w-4 h-4" />
+                  Mode Podcast
+                </button>
+                {podcastMode && (
+                  <span className="text-xs text-muted-foreground">
+                    Le contenu sera transforme en conversation podcast 2 speakers
+                  </span>
+                )}
+              </div>
 
-          {/* Action Button */}
-          {isProcessing ? (
-            <button
-              onClick={handleCancel}
-              className="w-full py-4 rounded-xl bg-destructive text-destructive-foreground font-display font-semibold text-base hover:brightness-110 transition-all flex items-center justify-center gap-2"
-            >
-              <XCircle className="w-5 h-5" />
-              Annuler le traitement
-            </button>
-          ) : !waitingForNext ? (
-            <button
-              onClick={handleProcess}
-              disabled={inputMode === "file" && selectedFiles.length === 0}
-              className="w-full py-4 rounded-xl bg-primary text-primary-foreground font-display font-semibold text-base hover:brightness-110 transition-all flex items-center justify-center gap-2 disabled:opacity-50"
-            >
-              <Mic className="w-5 h-5" />
-              {skipTranslation
-                ? "Generer l'audio"
-                : inputMode === "file"
-                ? selectedFiles.length > 1
-                  ? `Traduire ${selectedFiles.length} fichiers`
-                  : "Traduire & Generer l'audio"
-                : "Transcrire & Traduire"}
-            </button>
-          ) : null}
+              {/* Action Button */}
+              {isProcessing ? (
+                <button
+                  onClick={handleCancel}
+                  className="w-full py-4 rounded-xl bg-destructive text-destructive-foreground font-display font-semibold text-base hover:brightness-110 transition-all flex items-center justify-center gap-2"
+                >
+                  <XCircle className="w-5 h-5" />
+                  Annuler le traitement
+                </button>
+              ) : !waitingForNext ? (
+                <button
+                  onClick={handleProcess}
+                  disabled={inputMode === "file" && selectedFiles.length === 0}
+                  className="w-full py-4 rounded-xl bg-primary text-primary-foreground font-display font-semibold text-base hover:brightness-110 transition-all flex items-center justify-center gap-2 disabled:opacity-50"
+                >
+                  <Mic className="w-5 h-5" />
+                  {skipTranslation
+                    ? "Generer l'audio"
+                    : inputMode === "file"
+                    ? selectedFiles.length > 1
+                      ? `Traduire ${selectedFiles.length} fichiers`
+                      : "Traduire & Generer l'audio"
+                    : "Transcrire & Traduire"}
+                </button>
+              ) : null}
+            </>
+          )}
         </motion.section>
 
         {/* Queue Progress Bar */}

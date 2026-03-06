@@ -818,6 +818,64 @@ app.post('/api/merge-local-video', requireAuth, async (req, res) => {
   }
 });
 
+// ===== Combine multiple audio files =====
+app.post('/api/combine-audio', requireAuth, upload.array('files', 50), async (req, res) => {
+  const files = req.files as Express.Multer.File[];
+
+  if (!files || files.length < 2) {
+    return res.status(400).json({ error: 'Au moins 2 fichiers audio requis.' });
+  }
+
+  const tmpDir = path.join(os.tmpdir(), `harmony-combine-${Date.now()}`);
+  fs.mkdirSync(tmpDir, { recursive: true });
+
+  try {
+    // Create ffmpeg concat list file (demuxer approach for reliable concatenation)
+    const listPath = path.join(tmpDir, 'list.txt');
+    const entries: string[] = [];
+
+    for (let i = 0; i < files.length; i++) {
+      const ext = path.extname(files[i].originalname).toLowerCase() || '.mp3';
+      const safePath = path.join(tmpDir, `input_${i}${ext}`);
+      fs.renameSync(files[i].path, safePath);
+      entries.push(`file '${safePath.replace(/'/g, "'\\''")}'`);
+    }
+
+    fs.writeFileSync(listPath, entries.join('\n'));
+
+    const outputPath = path.join(outputDir, `combined_${Date.now()}.mp3`);
+
+    // Use ffmpeg concat demuxer — re-encodes to ensure consistent format
+    const { execSync } = await import('child_process');
+    execSync(
+      `ffmpeg -y -f concat -safe 0 -i "${listPath}" -acodec libmp3lame -ab 192k "${outputPath}"`,
+      { timeout: 120000, stdio: 'pipe' }
+    );
+
+    // Cleanup temp files
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+
+    const stats = fs.statSync(outputPath);
+    const fileName = path.basename(outputPath);
+
+    console.log(`[Combine] ${files.length} files → ${fileName} (${(stats.size / 1024 / 1024).toFixed(1)}MB)`);
+
+    res.json({
+      audioUrl: `/api/audio/${fileName}`,
+      fileSize: `${(stats.size / 1024 / 1024).toFixed(1)}MB`,
+      fileCount: files.length,
+    });
+  } catch (error: any) {
+    console.error('[Combine] Error:', error.message);
+    // Cleanup on error
+    try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch {}
+    for (const f of files) {
+      try { fs.unlinkSync(f.path); } catch {}
+    }
+    res.status(500).json({ error: error.message || 'Erreur lors de la combinaison audio.' });
+  }
+});
+
 // ===== Saved Videos =====
 app.post('/api/videos/save', requireAuth, async (req, res) => {
   const user = (req as any).dbUser;
