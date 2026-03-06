@@ -1,6 +1,5 @@
 import OpenAI from 'openai';
 import { ElevenLabsClient } from '@elevenlabs/elevenlabs-js';
-import { MsEdgeTTS, OUTPUT_FORMAT } from 'msedge-tts';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
@@ -137,12 +136,12 @@ export async function generateSpeechChunk(text: string): Promise<Buffer> {
     }
   }
 
-  // 4. Ultimate fallback: Edge TTS (free, no API key needed)
+  // 4. Ultimate fallback: Google Translate TTS (free, no API key needed)
   try {
-    console.log('[TTS] Using Edge TTS fallback (free, fr-FR-DeniseNeural)');
-    return await generateWithEdgeTTS(text);
+    console.log(`[TTS] Using Google Translate TTS fallback (free, lang=${edgeTTSLang})`);
+    return await generateWithGoogleTTS(text, edgeTTSLang);
   } catch (err: any) {
-    console.error(`[TTS] Edge TTS failed: ${err.message}`);
+    console.error(`[TTS] Google Translate TTS failed: ${err?.message || err}`);
   }
 
   throw new Error('Aucun provider TTS disponible. Tous les providers ont échoué ou sont désactivés.');
@@ -198,60 +197,93 @@ async function generateWithGemini(text: string, apiKey: string): Promise<Buffer>
   return pcmToMp3(pcmBuffer);
 }
 
-// Edge TTS voice mapping per language
-const EDGE_TTS_VOICES: Record<string, string> = {
-  fr: 'fr-FR-DeniseNeural',
-  en: 'en-US-JennyNeural',
-  es: 'es-ES-ElviraNeural',
-  de: 'de-DE-KatjaNeural',
-  pt: 'pt-BR-FranciscaNeural',
-  it: 'it-IT-ElsaNeural',
-  ar: 'ar-SA-ZariyahNeural',
-  zh: 'zh-CN-XiaoxiaoNeural',
-  ja: 'ja-JP-NanamiNeural',
-  ko: 'ko-KR-SunHiNeural',
-  ru: 'ru-RU-SvetlanaNeural',
-  hi: 'hi-IN-SwaraNeural',
-};
-
-let edgeTTSLang = 'fr'; // set by caller via setEdgeTTSLang
+let edgeTTSLang = 'fr'; // target language for free TTS fallback
 
 export function setEdgeTTSLang(lang: string) {
   edgeTTSLang = lang;
 }
 
 /**
- * Generate speech with Microsoft Edge TTS (free, no API key).
- * Returns MP3 buffer. Uses toFile for reliability.
+ * Google Translate TTS: free, no API key, simple HTTP GET.
+ * Limited to ~200 chars per request, so we split and concatenate.
  */
-async function generateWithEdgeTTS(text: string): Promise<Buffer> {
-  const voice = EDGE_TTS_VOICES[edgeTTSLang] || EDGE_TTS_VOICES.fr;
-  const tts = new MsEdgeTTS();
-  await tts.setMetadata(voice, OUTPUT_FORMAT.AUDIO_24KHZ_96KBITRATE_MONO_MP3);
+const GTTS_MAX_CHARS = 200;
 
-  const tmpDir = os.tmpdir();
-  const outputDir = path.join(tmpDir, 'edge-tts-output');
-  if (!fs.existsSync(outputDir)) fs.mkdirSync(outputDir, { recursive: true });
+function splitForGTTS(text: string): string[] {
+  if (text.length <= GTTS_MAX_CHARS) return [text];
 
-  try {
-    const { audioFilePath } = await tts.toFile(outputDir, text);
-    const buffer = fs.readFileSync(audioFilePath);
+  const sentences = text.split(/(?<=[.!?,;:])\s+/);
+  const chunks: string[] = [];
+  let current = '';
 
-    // Cleanup temp file
-    try { fs.unlinkSync(audioFilePath); } catch {}
+  for (const sentence of sentences) {
+    if ((current + ' ' + sentence).length > GTTS_MAX_CHARS && current.length > 0) {
+      chunks.push(current.trim());
+      current = sentence;
+    } else {
+      current += (current ? ' ' : '') + sentence;
+    }
+  }
+  if (current.trim()) chunks.push(current.trim());
 
-    tts.close();
+  // Hard split any remaining oversized chunks
+  const result: string[] = [];
+  for (const chunk of chunks) {
+    if (chunk.length <= GTTS_MAX_CHARS) {
+      result.push(chunk);
+    } else {
+      // Split on word boundary
+      let remaining = chunk;
+      while (remaining.length > GTTS_MAX_CHARS) {
+        let splitAt = remaining.lastIndexOf(' ', GTTS_MAX_CHARS);
+        if (splitAt <= 0) splitAt = GTTS_MAX_CHARS;
+        result.push(remaining.slice(0, splitAt).trim());
+        remaining = remaining.slice(splitAt).trim();
+      }
+      if (remaining) result.push(remaining);
+    }
+  }
 
-    if (buffer.length === 0) {
-      throw new Error('Edge TTS returned empty audio');
+  return result;
+}
+
+async function generateWithGoogleTTS(text: string, lang: string): Promise<Buffer> {
+  const subChunks = splitForGTTS(text);
+  const audioBuffers: Buffer[] = [];
+
+  console.log(`[TTS] Google Translate TTS: ${subChunks.length} sub-chunks for ${text.length} chars`);
+
+  for (let i = 0; i < subChunks.length; i++) {
+    const encoded = encodeURIComponent(subChunks[i]);
+    const url = `https://translate.google.com/translate_tts?ie=UTF-8&q=${encoded}&tl=${lang}&client=tw-ob&idx=${i}&total=${subChunks.length}`;
+
+    const response = await fetch(url, {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+        'Referer': 'https://translate.google.com/',
+      },
+    });
+
+    if (!response.ok) {
+      throw new Error(`Google TTS HTTP ${response.status} for chunk ${i + 1}/${subChunks.length}`);
     }
 
-    console.log(`[TTS] Edge TTS generated ${(buffer.length / 1024).toFixed(1)}KB audio`);
-    return buffer;
-  } catch (err) {
-    tts.close();
-    throw err;
+    const buffer = Buffer.from(await response.arrayBuffer());
+    if (buffer.length === 0) {
+      throw new Error(`Google TTS returned empty audio for chunk ${i + 1}`);
+    }
+
+    audioBuffers.push(buffer);
+
+    // Small delay to avoid rate limiting
+    if (i < subChunks.length - 1) {
+      await new Promise(r => setTimeout(r, 100));
+    }
   }
+
+  const finalBuffer = Buffer.concat(audioBuffers);
+  console.log(`[TTS] Google Translate TTS generated ${(finalBuffer.length / 1024).toFixed(1)}KB audio`);
+  return finalBuffer;
 }
 
 /**
