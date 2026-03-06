@@ -921,8 +921,17 @@ app.post('/api/combine-audio', requireAuth, upload.array('files', 50), async (re
 
     for (let i = 0; i < files.length; i++) {
       const ext = path.extname(files[i].originalname).toLowerCase() || '.mp3';
-      const safePath = path.join(tmpDir, `input_${i}${ext}`);
-      fs.renameSync(files[i].path, safePath);
+      const rawPath = path.join(tmpDir, `raw_${i}${ext}`);
+      const safePath = path.join(tmpDir, `input_${i}.mp3`);
+      fs.renameSync(files[i].path, rawPath);
+
+      // Normalize each file to consistent format (44100Hz, stereo, MP3 192k)
+      // This prevents duration/speed issues when concatenating heterogeneous files
+      execSync(
+        `ffmpeg -y -i "${rawPath}" -ar 44100 -ac 2 -acodec libmp3lame -ab 192k "${safePath}"`,
+        { timeout: 120000, stdio: 'pipe' }
+      );
+
       entries.push(`file '${safePath.replace(/'/g, "'\\''")}'`);
 
       // Add silence between files (not after the last one)
@@ -936,9 +945,9 @@ app.post('/api/combine-audio', requireAuth, upload.array('files', 50), async (re
     const concatPath = path.join(tmpDir, 'concat_raw.mp3');
     const outputPath = path.join(outputDir, `combined_${Date.now()}.mp3`);
 
-    // Step 1: Concat all files
+    // Step 1: Concat all files (all pre-normalized to same format, so -c copy is safe)
     execSync(
-      `ffmpeg -y -f concat -safe 0 -i "${listPath}" -acodec libmp3lame -ab 192k "${concatPath}"`,
+      `ffmpeg -y -f concat -safe 0 -i "${listPath}" -c copy "${concatPath}"`,
       { timeout: 300000, stdio: 'pipe' }
     );
 
