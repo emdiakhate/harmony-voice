@@ -16,7 +16,9 @@
     "db:generate": "prisma generate",
     "db:migrate": "prisma migrate dev",
     "db:studio": "prisma studio",
-    "postinstall": "prisma generate"
+    "postinstall": "prisma generate",
+    "setup:piper": "bash scripts/setup-piper.sh",
+    "setup:piper:win": "powershell -ExecutionPolicy Bypass -File scripts/setup-piper.ps1"
   },
   "dependencies": {
     "@clerk/clerk-react": "^5.61.1",

@@ -5,6 +5,7 @@ import os from 'os';
 import path from 'path';
 import { execFile } from 'child_process';
 import { promisify } from 'util';
+import { isPiperAvailable, hasVoiceForLang, generateLongTextWithPiper } from './piper-tts.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -32,7 +33,7 @@ const OPENAI_VOICES: Record<string, 'onyx' | 'nova'> = {
 
 interface PodcastTTSResult {
   audioBuffer: Buffer;
-  provider: 'gemini' | 'elevenlabs' | 'openai';
+  provider: 'gemini' | 'elevenlabs' | 'openai' | 'piper';
 }
 
 /**
@@ -84,7 +85,20 @@ export async function generatePodcastAudio(
     }
   }
 
-  throw new Error('Aucun provider Podcast TTS disponible. Configurez GOOGLE_API_KEY, ELEVENLABS_API_KEY ou OPENAI_API_KEY.');
+  // 4. Piper TTS — local, free, two voices for podcast
+  if (isPiperAvailable() && hasVoiceForLang('fr')) {
+    try {
+      console.log('[PodcastTTS] Attempting Piper TTS (local)...');
+      onProgress?.(0, 'Génération avec Piper (local)...', 'piper');
+      const audioBuffer = await generatePodcastWithPiper(script, onProgress);
+      console.log(`[PodcastTTS] Piper success: ${(audioBuffer.length / 1024 / 1024).toFixed(2)}MB`);
+      return { audioBuffer, provider: 'piper' };
+    } catch (error: any) {
+      console.error('[PodcastTTS] Piper error:', error.message);
+    }
+  }
+
+  throw new Error('Aucun provider Podcast TTS disponible. Configurez GOOGLE_API_KEY, ELEVENLABS_API_KEY, OPENAI_API_KEY ou installez Piper.');
 }
 
 /**
@@ -401,4 +415,35 @@ function splitLongText(text: string, maxLen: number): string[] {
   if (current.trim()) chunks.push(current.trim());
 
   return chunks;
+}
+
+/**
+ * Generate podcast audio with Piper using two different voices.
+ * Speaker 1 = primary voice, Speaker 2 = alt voice.
+ */
+async function generatePodcastWithPiper(
+  script: string,
+  onProgress?: (progress: number, message: string, provider?: string) => void,
+): Promise<Buffer> {
+  const segments = parseScriptSegments(script);
+  console.log(`[PodcastTTS] Piper: ${segments.length} segments`);
+
+  const audioBuffers: Buffer[] = [];
+
+  for (let i = 0; i < segments.length; i++) {
+    const { speaker, text } = segments[i];
+    const isAlt = speaker === 'Speaker 2';
+
+    onProgress?.(
+      Math.round((i / segments.length) * 100),
+      `Piper (${i + 1}/${segments.length})...`,
+      'piper',
+    );
+
+    const buffer = await generateLongTextWithPiper(text, 'fr', isAlt);
+    audioBuffers.push(buffer);
+  }
+
+  onProgress?.(100, 'Podcast audio généré avec Piper', 'piper');
+  return Buffer.concat(audioBuffers);
 }

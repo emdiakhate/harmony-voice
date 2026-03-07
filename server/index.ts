@@ -10,6 +10,7 @@ import { downloadYouTubeAudio, downloadYouTubeVideo, mergeVideoAudio, extractVid
 import { transcribeAudio } from './services/transcriber.js';
 import { translateText, PartialTranslationError, detectLanguage } from './services/translator.js';
 import { splitForTTS, generateSpeechChunk, setEdgeTTSLang } from './services/tts.js';
+import { getPiperStatus } from './services/piper-tts.js';
 import { extractTextFromFile } from './services/document-parser.js';
 import { generatePodcastScript } from './services/podcast-generator.js';
 import { generatePodcastAudio } from './services/podcast-tts.js';
@@ -1133,6 +1134,7 @@ app.get('/api/health', (_req, res) => {
     google: !!process.env.GOOGLE_API_KEY,
     openrouter: !!process.env.OPENROUTER_API_KEY,
     elevenlabs: !!process.env.ELEVENLABS_API_KEY,
+    piper: getPiperStatus(),
     auth: !!process.env.CLERK_SECRET_KEY,
   });
 });

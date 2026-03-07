@@ -5,6 +5,7 @@ import os from 'os';
 import path from 'path';
 import { execFile } from 'child_process';
 import { promisify } from 'util';
+import { isPiperAvailable, hasVoiceForLang, generateLongTextWithPiper } from './piper-tts.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -136,7 +137,17 @@ export async function generateSpeechChunk(text: string): Promise<Buffer> {
     }
   }
 
-  // 4. Ultimate fallback: Google Translate TTS (free, no API key needed)
+  // 4. Piper TTS — local, free, high quality
+  if (isPiperAvailable() && hasVoiceForLang(edgeTTSLang)) {
+    try {
+      console.log(`[TTS] Using Piper TTS (local, lang=${edgeTTSLang})`);
+      return await generateLongTextWithPiper(text, edgeTTSLang);
+    } catch (err: any) {
+      console.error(`[TTS] Piper TTS failed: ${err?.message || err}`);
+    }
+  }
+
+  // 5. Ultimate fallback: Google Translate TTS (free, no API key needed)
   try {
     console.log(`[TTS] Using Google Translate TTS fallback (free, lang=${edgeTTSLang})`);
     return await generateWithGoogleTTS(text, edgeTTSLang);
