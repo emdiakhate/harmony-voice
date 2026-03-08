@@ -158,9 +158,47 @@ const langToISO: Record<string, string> = {
 };
 
 /**
+ * Get media duration in seconds using ffprobe.
+ */
+async function getMediaDuration(filePath: string): Promise<number> {
+  try {
+    const { stdout } = await execAsync(
+      `ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "${filePath}"`,
+      { timeout: 10000 }
+    );
+    const duration = parseFloat(stdout.trim());
+    if (isNaN(duration)) throw new Error('Invalid duration');
+    return duration;
+  } catch {
+    return 0;
+  }
+}
+
+/**
+ * Build atempo filter chain for ffmpeg.
+ * atempo only accepts values between 0.5 and 100.0,
+ * so we chain multiple filters for extreme ratios.
+ */
+function buildAtempoFilter(ratio: number): string {
+  const filters: string[] = [];
+  let remaining = ratio;
+  while (remaining > 100.0) {
+    filters.push('atempo=100.0');
+    remaining /= 100.0;
+  }
+  while (remaining < 0.5) {
+    filters.push('atempo=0.5');
+    remaining /= 0.5;
+  }
+  filters.push(`atempo=${remaining.toFixed(4)}`);
+  return filters.join(',');
+}
+
+/**
  * Merge a video file with a translated audio track using ffmpeg.
  * Includes both original and translated audio tracks with language metadata,
  * so users can switch audio tracks in their video player (VLC, etc.).
+ * Automatically adjusts translated audio speed to match video duration.
  */
 export async function mergeVideoAudio(
   videoPath: string,
@@ -170,22 +208,57 @@ export async function mergeVideoAudio(
 ): Promise<void> {
   const targetISO = langToISO[targetLanguage || ''] || 'und';
 
-  // Include both audio tracks: original (from video) + translated
-  // -map 0:v:0  → video stream from input 0
-  // -map 0:a:0? → original audio from input 0 (optional, may not exist)
-  // -map 1:a:0  → translated audio from input 1
-  // Default disposition: translated audio is default track
+  // Get durations to calculate speed adjustment
+  const [videoDuration, audioDuration] = await Promise.all([
+    getMediaDuration(videoPath),
+    getMediaDuration(audioPath),
+  ]);
+
+  console.log(`[Merge] Video duration: ${videoDuration.toFixed(1)}s, Audio duration: ${audioDuration.toFixed(1)}s`);
+
+  // Calculate speed ratio: if audio is longer than video, speed it up
+  // Only adjust if both durations are valid and difference is > 5%
+  let atempoFilter = '';
+  if (videoDuration > 0 && audioDuration > 0) {
+    const ratio = audioDuration / videoDuration;
+    if (ratio > 1.05 || ratio < 0.95) {
+      // Clamp ratio to reasonable bounds (0.5x to 2.5x speed)
+      const clampedRatio = Math.min(2.5, Math.max(0.5, ratio));
+      atempoFilter = buildAtempoFilter(clampedRatio);
+      console.log(`[Merge] Adjusting audio speed: ${clampedRatio.toFixed(2)}x (atempo=${atempoFilter})`);
+    }
+  }
+
+  // Build ffmpeg command
+  // If we need atempo, we must pre-process the translated audio through a filter
+  // and use filter_complex to handle it properly
   try {
-    await execAsync(
-      `ffmpeg -i "${videoPath}" -i "${audioPath}" ` +
-      `-c:v copy -c:a aac -b:a 192k ` +
-      `-map 0:v:0 -map 0:a:0? -map 1:a:0 ` +
-      `-disposition:a:0 none -disposition:a:1 default ` +
-      `-metadata:s:a:0 language=eng -metadata:s:a:0 title="Audio original" ` +
-      `-metadata:s:a:1 language=${targetISO} -metadata:s:a:1 title="Audio traduit" ` +
-      `-shortest -y "${outputPath}"`,
-      { timeout: 300000 }
-    );
+    if (atempoFilter) {
+      // Use filter_complex to adjust translated audio speed before merging
+      await execAsync(
+        `ffmpeg -i "${videoPath}" -i "${audioPath}" ` +
+        `-filter_complex "[1:a]${atempoFilter}[adjusted]" ` +
+        `-c:v copy -c:a aac -b:a 192k ` +
+        `-map 0:v:0 -map 0:a:0? -map "[adjusted]" ` +
+        `-disposition:a:0 none -disposition:a:1 default ` +
+        `-metadata:s:a:0 language=eng -metadata:s:a:0 title="Audio original" ` +
+        `-metadata:s:a:1 language=${targetISO} -metadata:s:a:1 title="Audio traduit" ` +
+        `-shortest -y "${outputPath}"`,
+        { timeout: 300000 }
+      );
+    } else {
+      // No speed adjustment needed
+      await execAsync(
+        `ffmpeg -i "${videoPath}" -i "${audioPath}" ` +
+        `-c:v copy -c:a aac -b:a 192k ` +
+        `-map 0:v:0 -map 0:a:0? -map 1:a:0 ` +
+        `-disposition:a:0 none -disposition:a:1 default ` +
+        `-metadata:s:a:0 language=eng -metadata:s:a:0 title="Audio original" ` +
+        `-metadata:s:a:1 language=${targetISO} -metadata:s:a:1 title="Audio traduit" ` +
+        `-shortest -y "${outputPath}"`,
+        { timeout: 300000 }
+      );
+    }
   } catch (err: any) {
     throw new Error(`Erreur fusion vidéo/audio: ${err.stderr || err.message}`);
   }

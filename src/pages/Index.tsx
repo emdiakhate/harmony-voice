@@ -1154,6 +1154,7 @@ const Index = () => {
         onClose={() => setShowSaveDialog(false)}
         audioUrl={audioUrl}
         videoId={videoId || undefined}
+        localVideoUrl={localVideoUrl || undefined}
         title={saveTitle}
         sourceType={inputMode === "url" ? "youtube" : "file"}
         youtubeUrl={inputMode === "url" ? youtubeUrl : undefined}

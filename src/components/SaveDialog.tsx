@@ -24,6 +24,7 @@ interface SaveDialogProps {
   onClose: () => void;
   audioUrl: string;
   videoId?: string;
+  localVideoUrl?: string;
   title: string;
   sourceType: "youtube" | "file";
   youtubeUrl?: string;
@@ -39,6 +40,7 @@ export default function SaveDialog({
   onClose,
   audioUrl,
   videoId,
+  localVideoUrl,
   title,
   sourceType,
   youtubeUrl,
@@ -229,7 +231,7 @@ export default function SaveDialog({
                 <Music className="w-4 h-4" />
                 Telecharger l'audio (.mp3)
               </a>
-              {videoId && onDownloadVideo && (
+              {(videoId || localVideoUrl) && onDownloadVideo && (
                 <button
                   onClick={onDownloadVideo}
                   disabled={isDownloadingVideo}
