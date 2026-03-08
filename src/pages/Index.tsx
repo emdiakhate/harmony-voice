@@ -103,6 +103,7 @@ const Index = () => {
   const [audioChunks, setAudioChunks] = useState<string[]>([]);
   const [isTtsStreaming, setIsTtsStreaming] = useState(false);
   const [videoId, setVideoId] = useState("");
+  const [speechStartOffset, setSpeechStartOffset] = useState(0);
   const [steps, setSteps] = useState<ProcessingStep[]>([]);
   const [errorMessage, setErrorMessage] = useState("");
   const abortRef = useRef<AbortController | null>(null);
@@ -498,6 +499,7 @@ const Index = () => {
         if (data.data.localVideoUrl) setLocalVideoUrl(data.data.localVideoUrl);
         if (data.data.translatedText) setTranslation(data.data.translatedText);
         if (data.data.transcript) setTranscription(data.data.transcript);
+        if (data.data.speechStartOffset) setSpeechStartOffset(data.data.speechStartOffset);
         setSteps((prev) => prev.map((s) => ({ ...s, status: "done" })));
         toast.success("Traitement termine !");
         break;
@@ -540,14 +542,14 @@ const Index = () => {
         response = await fetch("/api/merge-local-video", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ localVideoUrl, audioUrl, targetLanguage: targetLang }),
+          body: JSON.stringify({ localVideoUrl, audioUrl, targetLanguage: targetLang, speechStartOffset }),
         });
       } else {
         // YouTube video
         response = await fetch("/api/merge-video", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ videoId, audioUrl, targetLanguage: targetLang }),
+          body: JSON.stringify({ videoId, audioUrl, targetLanguage: targetLang, speechStartOffset }),
         });
       }
 

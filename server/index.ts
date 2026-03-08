@@ -416,7 +416,8 @@ app.post('/api/process', requireAuth, requireQuota, async (req, res) => {
     // Step 2: Transcribe
     sendSSE(res, { step: 'transcript', message: 'Transcription avec Whisper IA...' });
     const { text: fullTranscript, segments } = await transcribeAudio(audioPath);
-    console.log(`[Process] Transcript: ${segments.length} segments, ${fullTranscript.length} chars`);
+    const speechStartOffset = segments.length > 0 ? segments[0].offset / 1000 : 0; // seconds
+    console.log(`[Process] Transcript: ${segments.length} segments, ${fullTranscript.length} chars, speech starts at ${speechStartOffset.toFixed(2)}s`);
     sendSSE(res, { step: 'transcript_done', data: { transcript: fullTranscript, segmentCount: segments.length } });
 
     cleanupAudioFile(audioPath);
@@ -496,7 +497,7 @@ app.post('/api/process', requireAuth, requireQuota, async (req, res) => {
 
     sendSSE(res, {
       step: 'done',
-      data: { audioUrl, translatedText, transcript: fullTranscript, videoId, podcastMode }
+      data: { audioUrl, translatedText, transcript: fullTranscript, videoId, podcastMode, speechStartOffset }
     });
 
   } catch (error: any) {
@@ -539,7 +540,7 @@ app.post('/api/process-file', requireAuth, requireQuota, upload.single('file'), 
 
   try {
     let originalText: string;
-
+    let speechStartOffset = 0;
     let localVideoUrl: string | undefined;
 
     if (userTranscript) {
@@ -572,7 +573,8 @@ app.post('/api/process-file', requireAuth, requireQuota, upload.single('file'), 
       sendSSE(res, { step: 'transcript', message: 'Transcription audio/vidéo avec Whisper IA...' });
       const { text: transcript, segments } = await transcribeAudio(renamedPath);
       originalText = transcript;
-      console.log(`[FileProcess] Transcribed media: ${segments.length} segments, ${originalText.length} chars from ${file.originalname}`);
+      speechStartOffset = segments.length > 0 ? segments[0].offset / 1000 : 0; // seconds
+      console.log(`[FileProcess] Transcribed media: ${segments.length} segments, ${originalText.length} chars from ${file.originalname}, speech starts at ${speechStartOffset.toFixed(2)}s`);
       sendSSE(res, {
         step: 'transcript_done',
         data: { transcript: originalText, segmentCount: segments.length }
@@ -678,7 +680,7 @@ app.post('/api/process-file', requireAuth, requireQuota, upload.single('file'), 
 
     sendSSE(res, {
       step: 'done',
-      data: { audioUrl, translatedText, transcript: originalText, podcastMode, localVideoUrl }
+      data: { audioUrl, translatedText, transcript: originalText, podcastMode, localVideoUrl, speechStartOffset }
     });
 
   } catch (error: any) {
@@ -738,7 +740,7 @@ app.post('/api/generate-podcast', requireAuth, requireQuota, async (req, res) =>
 
 // ===== Merge video + translated audio =====
 app.post('/api/merge-video', requireAuth, async (req, res) => {
-  const { videoId, audioUrl, targetLanguage } = req.body;
+  const { videoId, audioUrl, targetLanguage, speechStartOffset } = req.body;
 
   if (!videoId || !audioUrl) {
     return res.status(400).json({ error: 'videoId et audioUrl requis' });
@@ -761,7 +763,7 @@ app.post('/api/merge-video', requireAuth, async (req, res) => {
     const mergedPath = path.join(videoOutputDir, mergedFileName);
 
     console.log(`[Merge] Merging video + translated audio...`);
-    await mergeVideoAudio(videoPath, audioPath, mergedPath, targetLanguage);
+    await mergeVideoAudio(videoPath, audioPath, mergedPath, targetLanguage, speechStartOffset || 0);
 
     cleanupAudioFile(videoPath);
 
@@ -781,7 +783,7 @@ app.post('/api/merge-video', requireAuth, async (req, res) => {
 
 // ===== Merge local video + translated audio =====
 app.post('/api/merge-local-video', requireAuth, async (req, res) => {
-  const { localVideoUrl, audioUrl, targetLanguage } = req.body;
+  const { localVideoUrl, audioUrl, targetLanguage, speechStartOffset } = req.body;
 
   if (!localVideoUrl || !audioUrl) {
     return res.status(400).json({ error: 'localVideoUrl et audioUrl requis' });
@@ -804,7 +806,7 @@ app.post('/api/merge-local-video', requireAuth, async (req, res) => {
     const mergedPath = path.join(videoOutputDir, mergedFileName);
 
     console.log(`[MergeLocal] Merging ${videoFileName} + ${audioFileName}...`);
-    await mergeVideoAudio(videoPath, audioPath, mergedPath, targetLanguage);
+    await mergeVideoAudio(videoPath, audioPath, mergedPath, targetLanguage, speechStartOffset || 0);
 
     const stats = fs.statSync(mergedPath);
     console.log(`[MergeLocal] Done: ${mergedFileName} (${(stats.size / 1024 / 1024).toFixed(1)}MB)`);

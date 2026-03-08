@@ -196,17 +196,19 @@ function buildAtempoFilter(ratio: number): string {
 
 /**
  * Merge a video file with a translated audio track using ffmpeg.
- * Includes both original and translated audio tracks with language metadata,
- * so users can switch audio tracks in their video player (VLC, etc.).
- * Automatically adjusts translated audio speed to match video duration.
+ * - Adds silence at the start to align with when speech begins in the original
+ * - Adjusts audio speed so translated audio fits the video duration
+ * - Includes both original and translated audio tracks with language metadata
  */
 export async function mergeVideoAudio(
   videoPath: string,
   audioPath: string,
   outputPath: string,
   targetLanguage?: string,
+  speechStartOffset?: number,
 ): Promise<void> {
   const targetISO = langToISO[targetLanguage || ''] || 'und';
+  const delayMs = Math.round((speechStartOffset || 0) * 1000); // convert to ms
 
   // Get durations to calculate speed adjustment
   const [videoDuration, audioDuration] = await Promise.all([
@@ -214,47 +216,66 @@ export async function mergeVideoAudio(
     getMediaDuration(audioPath),
   ]);
 
-  console.log(`[Merge] Video duration: ${videoDuration.toFixed(1)}s, Audio duration: ${audioDuration.toFixed(1)}s`);
+  console.log(`[Merge] Video: ${videoDuration.toFixed(1)}s, Audio: ${audioDuration.toFixed(1)}s, Speech offset: ${(delayMs / 1000).toFixed(2)}s`);
 
-  // Calculate speed ratio: if audio is longer than video, speed it up
-  // Only adjust if both durations are valid and difference is > 5%
+  // Calculate speed ratio: translated audio (+ silence) should fit within video duration
+  // The effective audio duration = silence padding + adjusted audio
+  // So: speechStartOffset + (audioDuration / ratio) = videoDuration
+  // => ratio = audioDuration / (videoDuration - speechStartOffset)
   let atempoFilter = '';
-  if (videoDuration > 0 && audioDuration > 0) {
-    const ratio = audioDuration / videoDuration;
+  const availableDuration = videoDuration - (delayMs / 1000);
+  if (availableDuration > 0 && audioDuration > 0) {
+    const ratio = audioDuration / availableDuration;
     if (ratio > 1.05 || ratio < 0.95) {
-      // Clamp ratio to reasonable bounds (0.5x to 2.5x speed)
       const clampedRatio = Math.min(2.5, Math.max(0.5, ratio));
       atempoFilter = buildAtempoFilter(clampedRatio);
-      console.log(`[Merge] Adjusting audio speed: ${clampedRatio.toFixed(2)}x (atempo=${atempoFilter})`);
+      console.log(`[Merge] Speed adjustment: ${clampedRatio.toFixed(2)}x`);
     }
   }
 
-  // Build ffmpeg command
-  // If we need atempo, we must pre-process the translated audio through a filter
-  // and use filter_complex to handle it properly
+  // Build filter_complex chain for translated audio:
+  // 1. Apply atempo (speed adjustment) if needed
+  // 2. Apply adelay (silence padding) if needed
+  const filters: string[] = [];
+  let currentLabel = '1:a';
+  let needsFilterComplex = false;
+
+  if (atempoFilter) {
+    filters.push(`[${currentLabel}]${atempoFilter}[sped]`);
+    currentLabel = 'sped';
+    needsFilterComplex = true;
+  }
+
+  if (delayMs > 0) {
+    // adelay adds silence at the start (in ms), delays all channels
+    filters.push(`[${currentLabel}]adelay=${delayMs}|${delayMs}[delayed]`);
+    currentLabel = 'delayed';
+    needsFilterComplex = true;
+  }
+
+  const metadataFlags =
+    `-disposition:a:0 none -disposition:a:1 default ` +
+    `-metadata:s:a:0 language=eng -metadata:s:a:0 title="Audio original" ` +
+    `-metadata:s:a:1 language=${targetISO} -metadata:s:a:1 title="Audio traduit"`;
+
   try {
-    if (atempoFilter) {
-      // Use filter_complex to adjust translated audio speed before merging
+    if (needsFilterComplex) {
+      const filterGraph = filters.join(';');
       await execAsync(
         `ffmpeg -i "${videoPath}" -i "${audioPath}" ` +
-        `-filter_complex "[1:a]${atempoFilter}[adjusted]" ` +
+        `-filter_complex "${filterGraph}" ` +
         `-c:v copy -c:a aac -b:a 192k ` +
-        `-map 0:v:0 -map 0:a:0? -map "[adjusted]" ` +
-        `-disposition:a:0 none -disposition:a:1 default ` +
-        `-metadata:s:a:0 language=eng -metadata:s:a:0 title="Audio original" ` +
-        `-metadata:s:a:1 language=${targetISO} -metadata:s:a:1 title="Audio traduit" ` +
+        `-map 0:v:0 -map 0:a:0? -map "[${currentLabel}]" ` +
+        `${metadataFlags} ` +
         `-shortest -y "${outputPath}"`,
         { timeout: 300000 }
       );
     } else {
-      // No speed adjustment needed
       await execAsync(
         `ffmpeg -i "${videoPath}" -i "${audioPath}" ` +
         `-c:v copy -c:a aac -b:a 192k ` +
         `-map 0:v:0 -map 0:a:0? -map 1:a:0 ` +
-        `-disposition:a:0 none -disposition:a:1 default ` +
-        `-metadata:s:a:0 language=eng -metadata:s:a:0 title="Audio original" ` +
-        `-metadata:s:a:1 language=${targetISO} -metadata:s:a:1 title="Audio traduit" ` +
+        `${metadataFlags} ` +
         `-shortest -y "${outputPath}"`,
         { timeout: 300000 }
       );
