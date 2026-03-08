@@ -7,6 +7,7 @@ import { ClerkProvider, SignIn, SignUp } from "@clerk/clerk-react";
 import Index from "./pages/Index";
 import Dashboard from "./pages/Dashboard";
 import Playlists from "./pages/Playlists";
+import Settings from "./pages/Settings";
 import NotFound from "./pages/NotFound";
 import AuthGuard from "./components/AuthGuard";
 
@@ -34,6 +35,7 @@ const AppContent = () => (
           <Route path="/" element={<AuthGuard><Index /></AuthGuard>} />
           <Route path="/dashboard" element={<AuthGuard><Dashboard /></AuthGuard>} />
           <Route path="/playlists" element={<AuthGuard><Playlists /></AuthGuard>} />
+          <Route path="/settings" element={<AuthGuard><Settings /></AuthGuard>} />
           <Route path="*" element={<NotFound />} />
         </Routes>
       </BrowserRouter>
