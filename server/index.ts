@@ -738,7 +738,7 @@ app.post('/api/generate-podcast', requireAuth, requireQuota, async (req, res) =>
 
 // ===== Merge video + translated audio =====
 app.post('/api/merge-video', requireAuth, async (req, res) => {
-  const { videoId, audioUrl } = req.body;
+  const { videoId, audioUrl, targetLanguage } = req.body;
 
   if (!videoId || !audioUrl) {
     return res.status(400).json({ error: 'videoId et audioUrl requis' });
@@ -761,7 +761,7 @@ app.post('/api/merge-video', requireAuth, async (req, res) => {
     const mergedPath = path.join(videoOutputDir, mergedFileName);
 
     console.log(`[Merge] Merging video + translated audio...`);
-    await mergeVideoAudio(videoPath, audioPath, mergedPath);
+    await mergeVideoAudio(videoPath, audioPath, mergedPath, targetLanguage);
 
     cleanupAudioFile(videoPath);
 
@@ -781,7 +781,7 @@ app.post('/api/merge-video', requireAuth, async (req, res) => {
 
 // ===== Merge local video + translated audio =====
 app.post('/api/merge-local-video', requireAuth, async (req, res) => {
-  const { localVideoUrl, audioUrl } = req.body;
+  const { localVideoUrl, audioUrl, targetLanguage } = req.body;
 
   if (!localVideoUrl || !audioUrl) {
     return res.status(400).json({ error: 'localVideoUrl et audioUrl requis' });
@@ -804,7 +804,7 @@ app.post('/api/merge-local-video', requireAuth, async (req, res) => {
     const mergedPath = path.join(videoOutputDir, mergedFileName);
 
     console.log(`[MergeLocal] Merging ${videoFileName} + ${audioFileName}...`);
-    await mergeVideoAudio(videoPath, audioPath, mergedPath);
+    await mergeVideoAudio(videoPath, audioPath, mergedPath, targetLanguage);
 
     const stats = fs.statSync(mergedPath);
     console.log(`[MergeLocal] Done: ${mergedFileName} (${(stats.size / 1024 / 1024).toFixed(1)}MB)`);

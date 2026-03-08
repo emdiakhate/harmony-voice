@@ -149,12 +149,41 @@ export async function downloadYouTubeVideo(videoId: string): Promise<string> {
 }
 
 /**
- * Merge a video file with a translated audio track using ffmpeg.
+ * Language code mapping for ffmpeg metadata.
  */
-export async function mergeVideoAudio(videoPath: string, audioPath: string, outputPath: string): Promise<void> {
+const langToISO: Record<string, string> = {
+  fr: 'fre', en: 'eng', es: 'spa', de: 'ger', it: 'ita', pt: 'por',
+  ar: 'ara', zh: 'chi', ja: 'jpn', ko: 'kor', ru: 'rus', hi: 'hin',
+  tr: 'tur', nl: 'dut', pl: 'pol', sv: 'swe', da: 'dan', no: 'nor',
+};
+
+/**
+ * Merge a video file with a translated audio track using ffmpeg.
+ * Includes both original and translated audio tracks with language metadata,
+ * so users can switch audio tracks in their video player (VLC, etc.).
+ */
+export async function mergeVideoAudio(
+  videoPath: string,
+  audioPath: string,
+  outputPath: string,
+  targetLanguage?: string,
+): Promise<void> {
+  const targetISO = langToISO[targetLanguage || ''] || 'und';
+
+  // Include both audio tracks: original (from video) + translated
+  // -map 0:v:0  → video stream from input 0
+  // -map 0:a:0? → original audio from input 0 (optional, may not exist)
+  // -map 1:a:0  → translated audio from input 1
+  // Default disposition: translated audio is default track
   try {
     await execAsync(
-      `ffmpeg -i "${videoPath}" -i "${audioPath}" -c:v copy -map 0:v:0 -map 1:a:0 -shortest -y "${outputPath}"`,
+      `ffmpeg -i "${videoPath}" -i "${audioPath}" ` +
+      `-c:v copy -c:a aac -b:a 192k ` +
+      `-map 0:v:0 -map 0:a:0? -map 1:a:0 ` +
+      `-disposition:a:0 none -disposition:a:1 default ` +
+      `-metadata:s:a:0 language=eng -metadata:s:a:0 title="Audio original" ` +
+      `-metadata:s:a:1 language=${targetISO} -metadata:s:a:1 title="Audio traduit" ` +
+      `-shortest -y "${outputPath}"`,
       { timeout: 300000 }
     );
   } catch (err: any) {
@@ -165,7 +194,7 @@ export async function mergeVideoAudio(videoPath: string, audioPath: string, outp
     throw new Error("Échec de la fusion vidéo/audio.");
   }
 
-  console.log(`[Merge] Video merged: ${outputPath}`);
+  console.log(`[Merge] Video merged with dual audio tracks: ${outputPath}`);
 }
 
 /**

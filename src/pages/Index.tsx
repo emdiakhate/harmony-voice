@@ -540,14 +540,14 @@ const Index = () => {
         response = await fetch("/api/merge-local-video", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ localVideoUrl, audioUrl }),
+          body: JSON.stringify({ localVideoUrl, audioUrl, targetLanguage: targetLang }),
         });
       } else {
         // YouTube video
         response = await fetch("/api/merge-video", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ videoId, audioUrl }),
+          body: JSON.stringify({ videoId, audioUrl, targetLanguage: targetLang }),
         });
       }
 
