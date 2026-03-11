@@ -34,7 +34,7 @@ import AudioCombiner from "@/components/AudioCombiner";
 import PdfSplitter from "@/components/PdfSplitter";
 import { toast } from "sonner";
 
-type InputMode = "file" | "url" | "combine";
+type InputMode = "file" | "url" | "text" | "combine";
 
 interface ProcessingStep {
   id: string;
@@ -120,6 +120,10 @@ const Index = () => {
 
   // Local video preview (uploaded video files)
   const [localVideoUrl, setLocalVideoUrl] = useState("");
+
+  // Direct text input mode
+  const [pastedText, setPastedText] = useState("");
+  const [textSkipTranslation, setTextSkipTranslation] = useState(false);
 
   // Transcript-only mode: user provides their own transcript (already in target language)
   const [userTranscript, setUserTranscript] = useState("");
@@ -208,6 +212,10 @@ const Index = () => {
       toast.error("Veuillez ajouter un fichier");
       return;
     }
+    if (inputMode === "text" && !pastedText.trim()) {
+      toast.error("Veuillez coller du texte");
+      return;
+    }
 
     // Reset state
     setIsProcessing(true);
@@ -217,8 +225,61 @@ const Index = () => {
 
     abortRef.current = new AbortController();
 
-    if (inputMode === "url") {
-      // YouTube mode (unchanged)
+    if (inputMode === "text") {
+      // Direct text mode
+      const baseSteps: ProcessingStep[] = [];
+      if (!textSkipTranslation) {
+        baseSteps.push({ id: "translating", label: "Traduction", status: "pending" });
+      }
+      if (podcastMode) {
+        baseSteps.push(
+          { id: "podcast_script", label: "Generation script podcast", status: "pending" },
+          { id: "podcast_tts", label: "Generation audio podcast", status: "pending" },
+        );
+      } else {
+        baseSteps.push({ id: "tts", label: "Generation de l'audio", status: "pending" });
+      }
+      setSteps(baseSteps);
+
+      try {
+        const response = await fetch("/api/process-text", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            text: pastedText,
+            targetLanguage: targetLang,
+            podcastMode,
+            skipTranslation: textSkipTranslation,
+          }),
+          signal: abortRef.current.signal,
+        });
+
+        if (!response.ok) {
+          throw new Error("Erreur serveur. Verifiez que le backend est lance.");
+        }
+
+        await readSSEStream(response, handleSSEEvent);
+      } catch (error: any) {
+        if (error.name !== "AbortError") {
+          const msg = error.message?.includes("Failed to fetch")
+            ? "Impossible de contacter le serveur. Lancez le backend avec: npm run dev:server"
+            : error.message || "Erreur de connexion au serveur";
+          setErrorMessage(msg);
+          setSteps((prev) =>
+            prev.map((s) =>
+              s.status === "active" || s.status === "pending"
+                ? { ...s, status: "error" }
+                : s
+            )
+          );
+          toast.error(msg);
+        }
+      } finally {
+        setIsProcessing(false);
+        setIsTtsStreaming(false);
+      }
+    } else if (inputMode === "url") {
+      // YouTube mode
       const baseSteps: ProcessingStep[] = [
         { id: "download", label: "Extraction audio YouTube", status: "pending" },
         { id: "transcript", label: "Transcription Whisper IA", status: "pending" },
@@ -644,6 +705,8 @@ const Index = () => {
   const saveTitle =
     inputMode === "url"
       ? `YouTube - ${videoId || youtubeUrl}`
+      : inputMode === "text"
+      ? `Texte - ${pastedText.slice(0, 30).trim()}...`
       : currentFile?.name || "Document";
 
   return (
@@ -720,6 +783,17 @@ const Index = () => {
             >
               <Video className="w-4 h-4" />
               Lien YouTube
+            </button>
+            <button
+              onClick={() => setInputMode("text")}
+              className={`flex items-center gap-2 px-4 py-2.5 rounded-lg text-sm font-medium transition-all ${
+                inputMode === "text"
+                  ? "bg-primary text-primary-foreground"
+                  : "bg-muted text-muted-foreground hover:text-foreground"
+              }`}
+            >
+              <Type className="w-4 h-4" />
+              Texte
             </button>
             <button
               onClick={() => setInputMode("combine")}
@@ -800,7 +874,40 @@ const Index = () => {
                 </div>
               )}
             </div>
-          ) : (
+          ) : inputMode === "text" ? (
+            <div className="space-y-3">
+              <textarea
+                value={pastedText}
+                onChange={(e) => setPastedText(e.target.value)}
+                placeholder="Collez votre texte ici pour le traduire et generer l'audio..."
+                rows={8}
+                disabled={isProcessing}
+                className="w-full px-4 py-3 rounded-xl bg-muted border border-border text-sm text-foreground placeholder:text-muted-foreground focus:outline-none focus:ring-2 focus:ring-primary/50 resize-y disabled:opacity-50"
+              />
+              {pastedText.trim() && (
+                <div className="flex items-center justify-between">
+                  <span className="text-xs text-muted-foreground">
+                    {pastedText.trim().length} caracteres
+                  </span>
+                  <label className="flex items-center gap-2 cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={textSkipTranslation}
+                      onChange={(e) => setTextSkipTranslation(e.target.checked)}
+                      className="w-4 h-4 rounded border-border text-primary focus:ring-primary/50"
+                    />
+                    <span className="text-sm text-foreground">
+                      Deja en{" "}
+                      <strong className="text-primary">
+                        {targetLang === "fr" ? "francais" : targetLang === "en" ? "anglais" : targetLang}
+                      </strong>
+                      {" "}— generer directement l'audio
+                    </span>
+                  </label>
+                </div>
+              )}
+            </div>
+          ) : inputMode === "url" ? (
             <div className="relative">
               <Link className="absolute left-4 top-1/2 -translate-y-1/2 w-5 h-5 text-muted-foreground" />
               <input
@@ -812,7 +919,7 @@ const Index = () => {
                 className="w-full pl-12 pr-4 py-4 rounded-xl bg-muted border border-border text-foreground placeholder:text-muted-foreground focus:outline-none focus:ring-2 focus:ring-primary/50 transition-all disabled:opacity-50"
               />
             </div>
-          )}
+          ) : null}
 
           {/* Language Selectors */}
           {inputMode !== "combine" && (
@@ -867,11 +974,18 @@ const Index = () => {
               ) : !waitingForNext ? (
                 <button
                   onClick={handleProcess}
-                  disabled={inputMode === "file" && selectedFiles.length === 0}
+                  disabled={
+                    (inputMode === "file" && selectedFiles.length === 0) ||
+                    (inputMode === "text" && !pastedText.trim())
+                  }
                   className="w-full py-4 rounded-xl bg-primary text-primary-foreground font-display font-semibold text-base hover:brightness-110 transition-all flex items-center justify-center gap-2 disabled:opacity-50"
                 >
                   <Mic className="w-5 h-5" />
-                  {skipTranslation
+                  {inputMode === "text"
+                    ? textSkipTranslation
+                      ? "Generer l'audio"
+                      : "Traduire & Generer l'audio"
+                    : skipTranslation
                     ? "Generer l'audio"
                     : inputMode === "file"
                     ? selectedFiles.length > 1

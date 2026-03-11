@@ -692,6 +692,106 @@ app.post('/api/process-file', requireAuth, requireQuota, upload.single('file'), 
   res.end();
 });
 
+// ===== Direct text processing (paste text → translate → TTS) =====
+app.post('/api/process-text', requireAuth, requireQuota, async (req, res) => {
+  const user = (req as any).dbUser;
+
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+  res.setHeader('X-Accel-Buffering', 'no');
+  res.flushHeaders();
+
+  const { text, targetLanguage = 'fr', podcastMode = false, skipTranslation = false } = req.body || {};
+
+  if (!text || !text.trim()) {
+    sendSSE(res, { step: 'error', message: 'Aucun texte fourni.' });
+    return res.end();
+  }
+
+  if (!process.env.OPENAI_API_KEY && !process.env.GROQ_API_KEY && !process.env.OPENROUTER_API_KEY) {
+    sendSSE(res, { step: 'error', message: 'Aucune clé API configurée. Ajoutez GROQ_API_KEY, OPENROUTER_API_KEY ou OPENAI_API_KEY dans .env' });
+    return res.end();
+  }
+
+  const originalText = text.trim();
+  const filePrefix = `text_${Date.now()}`;
+
+  try {
+    let translatedText: string;
+    let audioUrl: string;
+
+    sendSSE(res, { step: 'extract_done', data: { text: originalText, charCount: originalText.length, source: 'text' } });
+
+    if (skipTranslation) {
+      translatedText = originalText;
+      console.log(`[TextProcess] Skip translation, direct TTS: ${translatedText.length} chars`);
+      sendSSE(res, { step: 'translation_done', data: { translatedText, skipped: true } });
+
+      if (podcastMode) {
+        audioUrl = await podcastPipeline(res, translatedText, filePrefix);
+      } else {
+        audioUrl = await streamingTTS(res, translatedText, filePrefix, targetLanguage);
+      }
+    } else if (podcastMode) {
+      sendSSE(res, { step: 'translating', message: 'Traduction en cours...' });
+
+      try {
+        translatedText = await translateText(originalText, targetLanguage, (progress) => {
+          sendSSE(res, { step: 'translating_progress', data: { progress } });
+        }, {
+          onProviderSwitch: (from, to) => {
+            console.log(`[TextProcess] Provider switch: ${from} → ${to}`);
+            sendSSE(res, { step: 'translating_provider_switch', data: { from, to } });
+          },
+        });
+      } catch (error: any) {
+        if (error instanceof PartialTranslationError && error.partialText) {
+          translatedText = error.partialText;
+          sendSSE(res, {
+            step: 'translating_partial',
+            data: {
+              translatedText: error.partialText,
+              completedChunks: error.completedChunks,
+              totalChunks: error.totalChunks,
+              message: error.message,
+            }
+          });
+        } else {
+          throw error;
+        }
+      }
+
+      sendSSE(res, { step: 'translation_done', data: { translatedText } });
+      audioUrl = await podcastPipeline(res, translatedText, filePrefix);
+    } else {
+      // Standard mode: pipeline translate + TTS
+      const result = await pipelinedTranslateAndTTS(res, originalText, filePrefix, targetLanguage);
+      translatedText = result.translatedText;
+      audioUrl = result.audioUrl;
+    }
+
+    // Record usage
+    const estimatedDuration = Math.ceil(translatedText.length / 15);
+    await recordUsage(user.id, podcastMode ? 'podcast' : 'tts', {
+      durationSeconds: estimatedDuration,
+      inputChars: originalText.length,
+      metadata: JSON.stringify({ source: 'text', targetLanguage, podcastMode, skipTranslation }),
+    });
+
+    sendSSE(res, {
+      step: 'done',
+      data: { audioUrl, translatedText, transcript: originalText, podcastMode }
+    });
+
+  } catch (error: any) {
+    console.error('[TextProcess] Error:', error.message);
+    sendSSE(res, { step: 'error', message: error.message || 'Erreur inattendue' });
+  }
+
+  res.end();
+});
+
 // ===== Generate podcast from existing translated text =====
 app.post('/api/generate-podcast', requireAuth, requireQuota, async (req, res) => {
   const user = (req as any).dbUser;
