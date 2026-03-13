@@ -3,10 +3,11 @@ import { ElevenLabsClient } from '@elevenlabs/elevenlabs-js';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
-import { execFile } from 'child_process';
+import { exec, execFile } from 'child_process';
 import { promisify } from 'util';
 import { isPiperAvailable, hasVoiceForLang, generateLongTextWithPiper } from './piper-tts.js';
 
+const execAsync = promisify(exec);
 const execFileAsync = promisify(execFile);
 
 const MAX_TTS_CHARS = 4096;
@@ -45,7 +46,7 @@ export function splitForTTS(text: string): string[] {
 }
 
 /**
- * TTS provider priority: ElevenLabs > OpenAI > Gemini
+ * TTS provider priority: ElevenLabs > OpenAI > Gemini > Piper (local) > Edge TTS (free) > Google Translate TTS
  * Falls back through providers on quota errors.
  * Once a provider fails with quota, it's disabled for the rest of the server session.
  */
@@ -145,9 +146,20 @@ export async function generateSpeechChunk(text: string): Promise<Buffer> {
     } catch (err: any) {
       console.error(`[TTS] Piper TTS failed: ${err?.message || err}`);
     }
+  } else {
+    const reason = !isPiperAvailable() ? 'binary not found' : `no voice for '${edgeTTSLang}'`;
+    console.warn(`[TTS] Piper TTS skipped (${reason}). Install Piper for better free TTS quality.`);
   }
 
-  // 5. Ultimate fallback: Google Translate TTS (free, no API key needed)
+  // 5. Edge TTS — free, good quality, Microsoft Azure voices via edge-tts CLI
+  try {
+    console.log(`[TTS] Using Edge TTS fallback (free, lang=${edgeTTSLang})`);
+    return await generateWithEdgeTTS(text, edgeTTSLang);
+  } catch (err: any) {
+    console.error(`[TTS] Edge TTS failed: ${err?.message || err}`);
+  }
+
+  // 6. Ultimate fallback: Google Translate TTS (free, no API key needed, lower quality)
   try {
     console.log(`[TTS] Using Google Translate TTS fallback (free, lang=${edgeTTSLang})`);
     return await generateWithGoogleTTS(text, edgeTTSLang);
@@ -295,6 +307,57 @@ async function generateWithGoogleTTS(text: string, lang: string): Promise<Buffer
   const finalBuffer = Buffer.concat(audioBuffers);
   console.log(`[TTS] Google Translate TTS generated ${(finalBuffer.length / 1024).toFixed(1)}KB audio`);
   return finalBuffer;
+}
+
+/**
+ * Edge TTS voice map — Microsoft Azure free voices via edge-tts CLI.
+ * Install: pip install edge-tts
+ */
+const EDGE_TTS_VOICES: Record<string, string> = {
+  fr: 'fr-FR-DeniseNeural',
+  en: 'en-US-JennyNeural',
+  es: 'es-ES-ElviraNeural',
+  de: 'de-DE-KatjaNeural',
+  it: 'it-IT-ElsaNeural',
+  pt: 'pt-BR-FranciscaNeural',
+  ar: 'ar-SA-ZariyahNeural',
+  zh: 'zh-CN-XiaoxiaoNeural',
+  ja: 'ja-JP-NanamiNeural',
+  ko: 'ko-KR-SunHiNeural',
+  ru: 'ru-RU-SvetlanaNeural',
+  hi: 'hi-IN-SwaraNeural',
+  tr: 'tr-TR-EmelNeural',
+  nl: 'nl-NL-ColetteNeural',
+  pl: 'pl-PL-AgnieszkaNeural',
+  sv: 'sv-SE-SofieNeural',
+};
+
+async function generateWithEdgeTTS(text: string, lang: string): Promise<Buffer> {
+  const voice = EDGE_TTS_VOICES[lang] || EDGE_TTS_VOICES['en'];
+  const tmpDir = os.tmpdir();
+  const outPath = path.join(tmpDir, `edge_tts_${Date.now()}.mp3`);
+
+  // edge-tts writes directly to file
+  const escapedText = text.replace(/"/g, '\\"');
+  try {
+    await execAsync(
+      `edge-tts --voice "${voice}" --text "${escapedText}" --write-media "${outPath}"`,
+      { timeout: 120000 }
+    );
+  } catch (err: any) {
+    // Clean up on failure
+    try { fs.unlinkSync(outPath); } catch {}
+    throw new Error(`Edge TTS error: ${err.stderr || err.message}`);
+  }
+
+  if (!fs.existsSync(outPath)) {
+    throw new Error('Edge TTS produced no output');
+  }
+
+  const buffer = fs.readFileSync(outPath);
+  try { fs.unlinkSync(outPath); } catch {}
+  console.log(`[TTS] Edge TTS generated ${(buffer.length / 1024).toFixed(0)}KB audio (${voice})`);
+  return buffer;
 }
 
 /**
