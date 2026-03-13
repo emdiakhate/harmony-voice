@@ -31,7 +31,7 @@ app.use(createAuthMiddleware());
 
 // Multer for file uploads (200MB limit for video/audio)
 const upload = multer({
-  dest: path.join(os.tmpdir(), 'harmony-voice-uploads'),
+  dest: path.join(os.tmpdir(), 'vocaleez-ai-uploads'),
   limits: { fileSize: 200 * 1024 * 1024 },
 });
 
@@ -1002,7 +1002,7 @@ app.post('/api/combine-audio', requireAuth, upload.array('files', 50), async (re
   const normalize = req.body.normalize === 'true';
   const silenceGap = parseFloat(req.body.silenceGap || '0');
 
-  const tmpDir = path.join(os.tmpdir(), `harmony-combine-${Date.now()}`);
+  const tmpDir = path.join(os.tmpdir(), `vocaleez-combine-${Date.now()}`);
   fs.mkdirSync(tmpDir, { recursive: true });
 
   try {

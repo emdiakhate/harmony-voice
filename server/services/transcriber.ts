@@ -64,7 +64,7 @@ async function transcribeInChunks(
 
   console.log(`[Transcriber] Audio: ${audioDuration.toFixed(0)}s, ${sizeMB.toFixed(1)}MB → ${numberOfChunks} chunks of ~${chunkDurationSecs}s`);
 
-  const tmpDir = path.join(os.tmpdir(), 'harmony-voice', 'chunks');
+  const tmpDir = path.join(os.tmpdir(), 'vocaleez-ai', 'chunks');
   if (!fs.existsSync(tmpDir)) fs.mkdirSync(tmpDir, { recursive: true });
 
   const chunkPaths: string[] = [];

@@ -54,7 +54,7 @@ async function findYtDlp(): Promise<{ command: string; useShell: boolean }> {
  * Returns the path to the downloaded MP3 file.
  */
 export async function downloadYouTubeAudio(videoId: string): Promise<string> {
-  const tmpDir = path.join(os.tmpdir(), 'harmony-voice');
+  const tmpDir = path.join(os.tmpdir(), 'vocaleez-ai');
   if (!fs.existsSync(tmpDir)) fs.mkdirSync(tmpDir, { recursive: true });
 
   const outputTemplate = path.join(tmpDir, `${videoId}.%(ext)s`);
@@ -107,7 +107,7 @@ export async function downloadYouTubeAudio(videoId: string): Promise<string> {
  * Returns the path to the downloaded video file.
  */
 export async function downloadYouTubeVideo(videoId: string): Promise<string> {
-  const tmpDir = path.join(os.tmpdir(), 'harmony-voice');
+  const tmpDir = path.join(os.tmpdir(), 'vocaleez-ai');
   if (!fs.existsSync(tmpDir)) fs.mkdirSync(tmpDir, { recursive: true });
 
   const outputTemplate = path.join(tmpDir, `${videoId}_video.%(ext)s`);

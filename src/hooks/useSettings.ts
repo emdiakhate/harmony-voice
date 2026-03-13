@@ -106,7 +106,7 @@ const DEFAULT_ASSIGNMENTS: TaskProviderAssignment = {
 
 // --- Storage ---
 
-const STORAGE_KEY = "harmony-voice-settings";
+const STORAGE_KEY = "vocaleez-ai-settings";
 
 function generateId(): string {
   return Math.random().toString(36).slice(2, 10);
