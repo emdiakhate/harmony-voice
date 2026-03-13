@@ -50,10 +50,14 @@ function Download-Voice {
 
     Write-Host "[*] Downloading voice: $ModelName ..." -ForegroundColor Yellow
     $langShort = $LangCode.Split("_")[0]
+    # Model name format: fr_FR-siwis-medium → voice=siwis, quality=medium
+    $parts = $ModelName -replace "^${LangCode}-", "" -split "-"
+    $voiceName = $parts[0]
+    $quality = $parts[1]
 
-    Invoke-WebRequest -Uri "$HUGGINGFACE_BASE/$langShort/$LangCode/$ModelName/$ModelName.onnx" `
+    Invoke-WebRequest -Uri "$HUGGINGFACE_BASE/$langShort/$LangCode/$voiceName/$quality/$ModelName.onnx" `
         -OutFile "$VOICES_DIR\$ModelName.onnx" -UseBasicParsing
-    Invoke-WebRequest -Uri "$HUGGINGFACE_BASE/$langShort/$LangCode/$ModelName/$ModelName.onnx.json" `
+    Invoke-WebRequest -Uri "$HUGGINGFACE_BASE/$langShort/$LangCode/$voiceName/$quality/$ModelName.onnx.json" `
         -OutFile "$VOICES_DIR\$ModelName.onnx.json" -UseBasicParsing
 
     Write-Host "[OK] Voice $ModelName downloaded" -ForegroundColor Green

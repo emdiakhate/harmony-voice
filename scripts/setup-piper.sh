@@ -80,13 +80,15 @@ download_voice() {
   fi
 
   echo "[*] Downloading voice: $model ..."
-  # Extract lang parts: fr_FR -> fr/fr_FR
+  # Extract parts: fr_FR-siwis-medium → lang_short=fr, voice_name=siwis, quality=medium
   local lang_short="${lang%%_*}"
-  local quality="${model##*-}"
+  local without_lang="${model#${lang}-}"
+  local voice_name="${without_lang%-*}"
+  local quality="${without_lang##*-}"
 
-  curl -L "$HUGGINGFACE_BASE/$lang_short/$lang/$model/$model.onnx" \
+  curl -L "$HUGGINGFACE_BASE/$lang_short/$lang/$voice_name/$quality/$model.onnx" \
     -o "$VOICES_DIR/${model}.onnx"
-  curl -L "$HUGGINGFACE_BASE/$lang_short/$lang/$model/$model.onnx.json" \
+  curl -L "$HUGGINGFACE_BASE/$lang_short/$lang/$voice_name/$quality/$model.onnx.json" \
     -o "$VOICES_DIR/${model}.onnx.json"
   echo "[OK] Voice $model downloaded"
 }
