@@ -19,6 +19,9 @@ dist-ssr
 # Server output
 server/output/
 
+# Piper TTS binary & voice models (large, downloaded via setup script)
+server/piper/
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json
@@ -29,3 +32,8 @@ server/output/
 *.njsproj
 *.sln
 *.sw?
+
+# Prisma
+/generated/prisma
+*.db
+*.db-journal

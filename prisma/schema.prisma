@@ -1,0 +1,76 @@
+generator client {
+  provider = "prisma-client"
+  output   = "../generated/prisma"
+}
+
+datasource db {
+  provider = "sqlite"
+}
+
+model User {
+  id        String   @id @default(cuid())
+  clerkId   String   @unique
+  email     String
+  plan      String   @default("free") // free, pro, business
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  usages    Usage[]
+  savedVideos SavedVideo[]
+  playlists   Playlist[]
+}
+
+model Usage {
+  id              String   @id @default(cuid())
+  userId          String
+  user            User     @relation(fields: [userId], references: [id])
+  type            String   // transcription, translation, tts, podcast
+  durationSeconds Int      @default(0)
+  creditsUsed     Int      @default(1) // 1 credit = 1 minute of audio
+  inputChars      Int      @default(0)
+  metadata        Json?
+  createdAt       DateTime @default(now())
+
+  @@index([userId, createdAt])
+}
+
+model SavedVideo {
+  id              String   @id @default(cuid())
+  userId          String
+  user            User     @relation(fields: [userId], references: [id])
+  title           String
+  youtubeUrl      String?
+  sourceType      String   // youtube, file
+  originalText    String?
+  translatedText  String?
+  audioUrl        String?
+  targetLanguage  String   @default("fr")
+  durationSeconds Int      @default(0)
+  thumbnailUrl    String?
+  createdAt       DateTime @default(now())
+  playlists       PlaylistVideo[]
+
+  @@index([userId, createdAt])
+}
+
+model Playlist {
+  id        String   @id @default(cuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id])
+  name      String
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  videos    PlaylistVideo[]
+
+  @@index([userId])
+}
+
+model PlaylistVideo {
+  id         String     @id @default(cuid())
+  playlistId String
+  playlist   Playlist   @relation(fields: [playlistId], references: [id], onDelete: Cascade)
+  videoId    String
+  video      SavedVideo @relation(fields: [videoId], references: [id], onDelete: Cascade)
+  addedAt    DateTime   @default(now())
+
+  @@unique([playlistId, videoId])
+}
