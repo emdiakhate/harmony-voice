@@ -21,6 +21,9 @@ import {
   FileVideo,
   Type,
   SkipForward,
+  AlignLeft,
+  Users,
+  MessageSquare,
 } from "lucide-react";
 import FileDropZone from "@/components/FileDropZone";
 import LanguageSelector from "@/components/LanguageSelector";
@@ -111,6 +114,12 @@ const Index = () => {
   // Podcast mode
   const [podcastMode, setPodcastMode] = useState(false);
   const [podcastScript, setPodcastScript] = useState("");
+  const [podcastTone, setPodcastTone] = useState<"formal" | "casual" | "humorous">("casual");
+  const [podcastSpeakerCount, setPodcastSpeakerCount] = useState<2 | 3 | 4>(2);
+
+  // Summary
+  const [summary, setSummary] = useState("");
+  const [isSummarizing, setIsSummarizing] = useState(false);
 
   // Video download state
   const [isDownloadingVideo, setIsDownloadingVideo] = useState(false);
@@ -146,6 +155,7 @@ const Index = () => {
     setErrorMessage("");
     setVideoId("");
     setPodcastScript("");
+    setSummary("");
     setShowSaveDialog(false);
     setLocalVideoUrl("");
     setSteps([]);
@@ -183,6 +193,10 @@ const Index = () => {
     formData.append("file", file);
     formData.append("targetLanguage", targetLang);
     formData.append("podcastMode", String(podcastMode));
+    if (podcastMode) {
+      formData.append("podcastTone", podcastTone);
+      formData.append("podcastSpeakerCount", String(podcastSpeakerCount));
+    }
     if (userTranscript.trim()) {
       formData.append("userTranscript", userTranscript.trim());
     }
@@ -250,6 +264,8 @@ const Index = () => {
             targetLanguage: targetLang,
             podcastMode,
             skipTranslation: textSkipTranslation,
+            podcastTone,
+            podcastSpeakerCount,
           }),
           signal: abortRef.current.signal,
         });
@@ -299,7 +315,13 @@ const Index = () => {
         const response = await fetch("/api/process", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ url: youtubeUrl, targetLanguage: targetLang, podcastMode }),
+          body: JSON.stringify({
+            url: youtubeUrl,
+            targetLanguage: targetLang,
+            podcastMode,
+            podcastTone,
+            podcastSpeakerCount,
+          }),
           signal: abortRef.current.signal,
         });
 
@@ -655,7 +677,11 @@ const Index = () => {
       const response = await fetch("/api/generate-podcast", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ translatedText: translation }),
+        body: JSON.stringify({
+          translatedText: translation,
+          podcastTone,
+          podcastSpeakerCount,
+        }),
         signal: abortRef.current.signal,
       });
 
@@ -679,6 +705,32 @@ const Index = () => {
       }
     } finally {
       setIsProcessing(false);
+    }
+  };
+
+  const handleSummarize = async () => {
+    const textToSummarize = transcription || translation;
+    if (!textToSummarize) return;
+
+    setIsSummarizing(true);
+    try {
+      const response = await fetch("/api/summarize", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ text: textToSummarize, language: targetLang }),
+      });
+
+      if (!response.ok) {
+        throw new Error("Erreur lors du résumé");
+      }
+
+      const data = await response.json();
+      setSummary(data.summary);
+      toast.success("Résumé généré !");
+    } catch (error: any) {
+      toast.error(error.message || "Erreur lors du résumé");
+    } finally {
+      setIsSummarizing(false);
     }
   };
 
@@ -942,23 +994,82 @@ const Index = () => {
               </div>
 
               {/* Podcast Mode Toggle */}
-              <div className="flex items-center gap-3">
-                <button
-                  onClick={() => setPodcastMode(!podcastMode)}
-                  disabled={isProcessing}
-                  className={`flex items-center gap-2 px-4 py-2.5 rounded-lg text-sm font-medium transition-all ${
-                    podcastMode
-                      ? "bg-primary text-primary-foreground"
-                      : "bg-muted text-muted-foreground hover:text-foreground"
-                  } disabled:opacity-50`}
-                >
-                  <Radio className="w-4 h-4" />
-                  Mode Podcast
-                </button>
+              <div className="space-y-3">
+                <div className="flex items-center gap-3">
+                  <button
+                    onClick={() => setPodcastMode(!podcastMode)}
+                    disabled={isProcessing}
+                    className={`flex items-center gap-2 px-4 py-2.5 rounded-lg text-sm font-medium transition-all ${
+                      podcastMode
+                        ? "bg-primary text-primary-foreground"
+                        : "bg-muted text-muted-foreground hover:text-foreground"
+                    } disabled:opacity-50`}
+                  >
+                    <Radio className="w-4 h-4" />
+                    Mode Podcast
+                  </button>
+                  {podcastMode && (
+                    <span className="text-xs text-muted-foreground">
+                      Podcast {podcastSpeakerCount} voix, ton {podcastTone === "formal" ? "formel" : podcastTone === "humorous" ? "humoristique" : "decontracte"}
+                    </span>
+                  )}
+                </div>
+
+                {/* Podcast Options */}
                 {podcastMode && (
-                  <span className="text-xs text-muted-foreground">
-                    Le contenu sera transforme en conversation podcast 2 speakers
-                  </span>
+                  <div className="p-4 rounded-xl bg-muted/50 border border-border/50 space-y-4">
+                    {/* Speaker Count */}
+                    <div className="space-y-2">
+                      <label className="flex items-center gap-2 text-sm font-medium text-foreground">
+                        <Users className="w-4 h-4 text-primary" />
+                        Nombre de voix
+                      </label>
+                      <div className="flex gap-2">
+                        {([2, 3, 4] as const).map((count) => (
+                          <button
+                            key={count}
+                            onClick={() => setPodcastSpeakerCount(count)}
+                            disabled={isProcessing}
+                            className={`px-4 py-2 rounded-lg text-sm font-medium transition-all ${
+                              podcastSpeakerCount === count
+                                ? "bg-primary text-primary-foreground"
+                                : "bg-background border border-border text-muted-foreground hover:text-foreground"
+                            } disabled:opacity-50`}
+                          >
+                            {count} voix
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+
+                    {/* Tone */}
+                    <div className="space-y-2">
+                      <label className="flex items-center gap-2 text-sm font-medium text-foreground">
+                        <MessageSquare className="w-4 h-4 text-primary" />
+                        Ton du podcast
+                      </label>
+                      <div className="flex gap-2">
+                        {([
+                          { value: "formal" as const, label: "Formel" },
+                          { value: "casual" as const, label: "Decontracte" },
+                          { value: "humorous" as const, label: "Humoristique" },
+                        ]).map(({ value, label }) => (
+                          <button
+                            key={value}
+                            onClick={() => setPodcastTone(value)}
+                            disabled={isProcessing}
+                            className={`px-4 py-2 rounded-lg text-sm font-medium transition-all ${
+                              podcastTone === value
+                                ? "bg-primary text-primary-foreground"
+                                : "bg-background border border-border text-muted-foreground hover:text-foreground"
+                            } disabled:opacity-50`}
+                          >
+                            {label}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                  </div>
                 )}
               </div>
 
@@ -1238,17 +1349,48 @@ const Index = () => {
           </section>
         )}
 
-        {/* Generate Podcast button (when translation exists and not already in podcast) */}
-        {translation && !isProcessing && !podcastScript && (
-          <div className="flex justify-center">
-            <button
-              onClick={handleGeneratePodcast}
-              className="flex items-center gap-2 px-6 py-3 rounded-xl bg-primary text-primary-foreground font-medium text-sm hover:opacity-90 transition-all"
-            >
-              <Radio className="w-4 h-4" />
-              Generer le Podcast a partir de la traduction
-            </button>
+        {/* Action buttons after transcription: Résumer + Generate Podcast */}
+        {(transcription || translation) && !isProcessing && (
+          <div className="flex justify-center gap-3 flex-wrap">
+            {/* Résumer button */}
+            {!summary && (
+              <button
+                onClick={handleSummarize}
+                disabled={isSummarizing}
+                className="flex items-center gap-2 px-6 py-3 rounded-xl bg-muted border border-border text-foreground font-medium text-sm hover:bg-muted/80 transition-all disabled:opacity-50"
+              >
+                {isSummarizing ? (
+                  <Loader2 className="w-4 h-4 animate-spin" />
+                ) : (
+                  <AlignLeft className="w-4 h-4" />
+                )}
+                {isSummarizing ? "Resume en cours..." : "Resumer"}
+              </button>
+            )}
+
+            {/* Generate Podcast button */}
+            {translation && !podcastScript && (
+              <button
+                onClick={handleGeneratePodcast}
+                className="flex items-center gap-2 px-6 py-3 rounded-xl bg-primary text-primary-foreground font-medium text-sm hover:opacity-90 transition-all"
+              >
+                <Radio className="w-4 h-4" />
+                Generer le Podcast
+              </button>
+            )}
           </div>
+        )}
+
+        {/* Summary Panel */}
+        {summary && (
+          <section>
+            <ResultsPanel
+              title="Resume"
+              content={summary}
+              icon={<AlignLeft className="w-5 h-5 text-primary" />}
+              isLoading={false}
+            />
+          </section>
         )}
 
         {/* Podcast Script */}

@@ -1,32 +1,55 @@
 import OpenAI from 'openai';
 import Groq from 'groq-sdk';
 
-const PODCAST_PROMPT = `I'll give you text content and I'd like you to write a podcast script IN FRENCH between two hosts.
+export type PodcastTone = 'formal' | 'casual' | 'humorous';
+export type PodcastSpeakerCount = 2 | 3 | 4;
+
+const TONE_INSTRUCTIONS: Record<PodcastTone, string> = {
+  formal: `Ton formel et professionnel. Utilisez un vocabulaire soutenu, des formulations élaborées, et maintenez un registre académique. Évitez les expressions familières.`,
+  casual: `Ton décontracté et naturel. Utilisez un langage courant, des expressions familières comme "Exactement," "Absolument," "C'est ça", "Tu vois ce que je veux dire". Soyez spontané et conversationnel.`,
+  humorous: `Ton humoristique et divertissant. Ajoutez des blagues, des jeux de mots, des anecdotes drôles, des comparaisons amusantes. Faites rire l'audience tout en restant informatif. Utilisez l'ironie et l'autodérision.`,
+};
+
+function buildPodcastPrompt(speakerCount: PodcastSpeakerCount, tone: PodcastTone): string {
+  const speakerLabels = Array.from({ length: speakerCount }, (_, i) => `Speaker ${i + 1}`);
+  const speakerFormat = speakerLabels.map(s => `"${s}:"`).join(', ');
+
+  const speakerRoles: Record<number, string> = {
+    2: `Speaker 1 est l'hôte principal qui pose des questions. Speaker 2 est l'expert qui explique.`,
+    3: `Speaker 1 est l'hôte principal qui guide la conversation. Speaker 2 est l'expert qui explique en détail. Speaker 3 est le curieux qui pose des questions naïves et apporte un angle différent.`,
+    4: `Speaker 1 est l'hôte principal qui guide la conversation. Speaker 2 est l'expert qui explique en détail. Speaker 3 apporte des contre-arguments et des perspectives alternatives. Speaker 4 est le curieux qui pose des questions et fait des analogies pour le public.`,
+  };
+
+  return `I'll give you text content and I'd like you to write a podcast script IN FRENCH with ${speakerCount} speakers.
 
 # FORMAT
 Your response must start exactly with:
 Please read aloud the following in a podcast interview style:
 Speaker 1:
 
-Then alternate between "Speaker 1:" and "Speaker 2:" for the rest.
+Then alternate between ${speakerFormat} for the rest.
+
+# TONE
+${TONE_INSTRUCTIONS[tone]}
 
 # INSTRUCTIONS
 1. Opening: Begin with interesting remarks on the topic, then introduce it as a "plongée en profondeur".
-2. Use two hosts in conversational back-and-forth in French.
-3. Keep language informal and accessible. Use "Exactement," "Absolument," "C'est ça" for flow.
+2. Use ${speakerCount} speakers in conversational back-and-forth in French.
+3. ${speakerRoles[speakerCount]}
 4. Use analogies: "C'est comme..."
-5. Have one host pose questions, the other explains.
-6. Address audience: "Donc pour tous ceux qui nous écoutent..."
-7. Conclude with: "Donc alors que nous concluons..." and a thought-provoking takeaway.
-8. End with: "Jusqu'à la prochaine fois, restez curieux !"
+5. Address audience: "Donc pour tous ceux qui nous écoutent..."
+6. Conclude with: "Donc alors que nous concluons..." and a thought-provoking takeaway.
+7. End with: "Jusqu'à la prochaine fois, restez curieux !"
 
 IMPORTANT: Only output the transcript IN FRENCH.
 IMPORTANT: Use \\n between speaker lines.
 IMPORTANT: Keep it concise but engaging (~2000-4000 words).
+IMPORTANT: Use ONLY these speaker labels: ${speakerFormat}.
 
 # SOURCE TEXT TO CREATE PODCAST FROM
 
 `;
+}
 
 const SYSTEM_MSG = 'You are a professional podcast script writer. You write engaging, natural-sounding podcast scripts in French.';
 
@@ -43,10 +66,15 @@ function getProvider(): 'groq' | 'openrouter' | 'openai' {
 /**
  * Generate a podcast-style script from text content using LLM.
  */
-export async function generatePodcastScript(text: string): Promise<string> {
+export async function generatePodcastScript(
+  text: string,
+  options?: { tone?: PodcastTone; speakerCount?: PodcastSpeakerCount },
+): Promise<string> {
   const provider = getProvider();
+  const tone = options?.tone || 'casual';
+  const speakerCount = options?.speakerCount || 2;
 
-  console.log(`[Podcast] Generating script with ${provider} (${text.length} chars input)`);
+  console.log(`[Podcast] Generating script with ${provider} (${text.length} chars input, tone=${tone}, speakers=${speakerCount})`);
 
   // Truncate input if too long (LLM context limits)
   const maxInputChars = 15000;
@@ -54,7 +82,7 @@ export async function generatePodcastScript(text: string): Promise<string> {
     ? text.substring(0, maxInputChars) + '\n\n[...]'
     : text;
 
-  const prompt = PODCAST_PROMPT + inputText;
+  const prompt = buildPodcastPrompt(speakerCount, tone) + inputText;
 
   let script: string;
 

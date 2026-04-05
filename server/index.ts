@@ -13,7 +13,7 @@ import { splitForTTS, generateSpeechChunk, setEdgeTTSLang } from './services/tts
 import { getPiperStatus } from './services/piper-tts.js';
 import { extractTextFromFile } from './services/document-parser.js';
 import { generatePodcastScript } from './services/podcast-generator.js';
-import { generatePodcastAudio } from './services/podcast-tts.js';
+import { generatePodcastAudio, AVAILABLE_VOICES } from './services/podcast-tts.js';
 import { createAuthMiddleware, requireAuth, requireQuota, requirePodcastAccess } from './lib/auth.js';
 import { recordUsage, getMonthlyUsage, checkQuota, PLAN_LIMITS } from './lib/quota.js';
 import { prisma } from './lib/prisma.js';
@@ -305,20 +305,24 @@ async function podcastPipeline(
   res: express.Response,
   translatedText: string,
   filePrefix: string,
+  podcastOptions?: { tone?: string; speakerCount?: number; voiceConfig?: Record<string, string> },
 ): Promise<string> {
   // Step A: Generate podcast script
   sendSSE(res, { step: 'podcast_script', message: 'Génération du script podcast...' });
-  const podcastScript = await generatePodcastScript(translatedText);
+  const podcastScript = await generatePodcastScript(translatedText, {
+    tone: (podcastOptions?.tone as any) || 'casual',
+    speakerCount: (podcastOptions?.speakerCount as any) || 2,
+  });
   console.log(`[Podcast] Script generated: ${podcastScript.length} chars`);
   sendSSE(res, { step: 'podcast_script_done', data: { script: podcastScript } });
 
-  // Step B: Generate podcast audio (Gemini > ElevenLabs > OpenAI)
-  sendSSE(res, { step: 'podcast_tts', message: 'Génération audio podcast...' });
+  // Step B: Generate podcast audio (Gemini > ElevenLabs > OpenAI) with jingles
+  sendSSE(res, { step: 'podcast_tts', message: 'Génération audio podcast (avec jingles)...' });
   let currentProvider = '';
   const { audioBuffer, provider } = await generatePodcastAudio(podcastScript, (progress, message, prov) => {
     if (prov) currentProvider = prov;
     sendSSE(res, { step: 'podcast_tts_progress', data: { progress, message, provider: currentProvider } });
-  });
+  }, podcastOptions?.voiceConfig);
 
   console.log(`[Podcast] Audio generated with ${provider}: ${(audioBuffer.length / 1024 / 1024).toFixed(2)}MB`);
 
@@ -375,7 +379,8 @@ app.get('/api/user/usage', requireAuth, async (req, res) => {
 // ===== YouTube processing (SSE stream) =====
 app.post('/api/process', requireAuth, requireQuota, async (req, res) => {
   const user = (req as any).dbUser;
-  const { url, targetLanguage = 'fr', podcastMode = false } = req.body;
+  const { url, targetLanguage = 'fr', podcastMode = false, podcastTone, podcastSpeakerCount, podcastVoiceConfig } = req.body;
+  const podcastOpts = podcastMode ? { tone: podcastTone, speakerCount: podcastSpeakerCount, voiceConfig: podcastVoiceConfig } : undefined;
 
   // Check podcast access
   if (podcastMode) {
@@ -442,7 +447,7 @@ app.post('/api/process', requireAuth, requireQuota, async (req, res) => {
       translatedText = fullTranscript;
       sendSSE(res, { step: 'translation_done', data: { translatedText, skipped: true } });
       if (podcastMode) {
-        audioUrl = await podcastPipeline(res, translatedText, videoId);
+        audioUrl = await podcastPipeline(res, translatedText, videoId, podcastOpts);
       } else {
         audioUrl = await streamingTTS(res, translatedText, videoId, targetLanguage);
       }
@@ -479,7 +484,7 @@ app.post('/api/process', requireAuth, requireQuota, async (req, res) => {
 
       console.log(`[Process] Translation done: ${translatedText.length} chars`);
       sendSSE(res, { step: 'translation_done', data: { translatedText } });
-      audioUrl = await podcastPipeline(res, translatedText, videoId);
+      audioUrl = await podcastPipeline(res, translatedText, videoId, podcastOpts);
     } else {
       // Standard mode: pipeline translate + TTS in parallel
       const result = await pipelinedTranslateAndTTS(res, fullTranscript, videoId, targetLanguage);
@@ -522,6 +527,11 @@ app.post('/api/process-file', requireAuth, requireQuota, upload.single('file'), 
   const file = req.file;
   const targetLanguage = req.body?.targetLanguage || 'fr';
   const podcastMode = req.body?.podcastMode === 'true';
+  const podcastOpts = podcastMode ? {
+    tone: req.body?.podcastTone,
+    speakerCount: req.body?.podcastSpeakerCount ? parseInt(req.body.podcastSpeakerCount) : undefined,
+    voiceConfig: req.body?.podcastVoiceConfig ? JSON.parse(req.body.podcastVoiceConfig) : undefined,
+  } : undefined;
   const userTranscript = req.body?.userTranscript?.trim() || '';
   let skipTranslation = req.body?.skipTranslation === 'true';
 
@@ -625,7 +635,7 @@ app.post('/api/process-file', requireAuth, requireQuota, upload.single('file'), 
       sendSSE(res, { step: 'translation_done', data: { translatedText, skipped: true } });
 
       if (podcastMode) {
-        audioUrl = await podcastPipeline(res, translatedText, filePrefix);
+        audioUrl = await podcastPipeline(res, translatedText, filePrefix, podcastOpts);
       } else {
         audioUrl = await streamingTTS(res, translatedText, filePrefix, targetLanguage);
       }
@@ -662,7 +672,7 @@ app.post('/api/process-file', requireAuth, requireQuota, upload.single('file'), 
 
       console.log(`[FileProcess] Translation done: ${translatedText.length} chars`);
       sendSSE(res, { step: 'translation_done', data: { translatedText } });
-      audioUrl = await podcastPipeline(res, translatedText, filePrefix);
+      audioUrl = await podcastPipeline(res, translatedText, filePrefix, podcastOpts);
     } else {
       // Standard mode: pipeline translate + TTS in parallel
       const result = await pipelinedTranslateAndTTS(res, originalText, filePrefix, targetLanguage);
@@ -702,7 +712,8 @@ app.post('/api/process-text', requireAuth, requireQuota, async (req, res) => {
   res.setHeader('X-Accel-Buffering', 'no');
   res.flushHeaders();
 
-  const { text, targetLanguage = 'fr', podcastMode = false, skipTranslation = false } = req.body || {};
+  const { text, targetLanguage = 'fr', podcastMode = false, skipTranslation = false, podcastTone, podcastSpeakerCount, podcastVoiceConfig } = req.body || {};
+  const podcastOpts = podcastMode ? { tone: podcastTone, speakerCount: podcastSpeakerCount, voiceConfig: podcastVoiceConfig } : undefined;
 
   if (!text || !text.trim()) {
     sendSSE(res, { step: 'error', message: 'Aucun texte fourni.' });
@@ -729,7 +740,7 @@ app.post('/api/process-text', requireAuth, requireQuota, async (req, res) => {
       sendSSE(res, { step: 'translation_done', data: { translatedText, skipped: true } });
 
       if (podcastMode) {
-        audioUrl = await podcastPipeline(res, translatedText, filePrefix);
+        audioUrl = await podcastPipeline(res, translatedText, filePrefix, podcastOpts);
       } else {
         audioUrl = await streamingTTS(res, translatedText, filePrefix, targetLanguage);
       }
@@ -763,7 +774,7 @@ app.post('/api/process-text', requireAuth, requireQuota, async (req, res) => {
       }
 
       sendSSE(res, { step: 'translation_done', data: { translatedText } });
-      audioUrl = await podcastPipeline(res, translatedText, filePrefix);
+      audioUrl = await podcastPipeline(res, translatedText, filePrefix, podcastOpts);
     } else {
       // Standard mode: pipeline translate + TTS
       const result = await pipelinedTranslateAndTTS(res, originalText, filePrefix, targetLanguage);
@@ -792,6 +803,72 @@ app.post('/api/process-text', requireAuth, requireQuota, async (req, res) => {
   res.end();
 });
 
+// ===== Available podcast voices =====
+app.get('/api/podcast-voices', (_req, res) => {
+  res.json(AVAILABLE_VOICES);
+});
+
+// ===== Summarize text =====
+app.post('/api/summarize', async (req, res) => {
+  const { text, language = 'fr' } = req.body;
+
+  if (!text || text.trim().length === 0) {
+    return res.status(400).json({ error: 'Texte requis.' });
+  }
+
+  try {
+    const maxChars = 15000;
+    const inputText = text.length > maxChars ? text.substring(0, maxChars) + '\n[...]' : text;
+
+    const prompt = `Résume le texte suivant de manière concise et structurée en ${language === 'fr' ? 'français' : language}.
+Fais un résumé clair avec les points clés. Le résumé doit faire environ 20% de la longueur du texte original.
+
+Texte à résumer:
+${inputText}`;
+
+    let summary: string;
+
+    if (process.env.GROQ_API_KEY) {
+      const Groq = (await import('groq-sdk')).default;
+      const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
+      const response = await groq.chat.completions.create({
+        model: 'llama-3.3-70b-versatile',
+        messages: [{ role: 'user', content: prompt }],
+        temperature: 0.3,
+        max_tokens: 4000,
+      });
+      summary = response.choices[0].message.content || '';
+    } else if (process.env.OPENROUTER_API_KEY) {
+      const OpenAI = (await import('openai')).default;
+      const openrouter = new OpenAI({ apiKey: process.env.OPENROUTER_API_KEY, baseURL: 'https://openrouter.ai/api/v1' });
+      const response = await openrouter.chat.completions.create({
+        model: 'meta-llama/llama-3.3-70b-instruct',
+        messages: [{ role: 'user', content: prompt }],
+        temperature: 0.3,
+        max_tokens: 4000,
+      });
+      summary = response.choices[0].message.content || '';
+    } else if (process.env.OPENAI_API_KEY) {
+      const OpenAI = (await import('openai')).default;
+      const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+      const response = await openai.chat.completions.create({
+        model: 'gpt-4o-mini',
+        messages: [{ role: 'user', content: prompt }],
+        temperature: 0.3,
+        max_tokens: 4000,
+      });
+      summary = response.choices[0].message.content || '';
+    } else {
+      return res.status(500).json({ error: 'Aucun provider LLM configuré.' });
+    }
+
+    res.json({ summary });
+  } catch (error: any) {
+    console.error('[Summarize] Error:', error.message);
+    res.status(500).json({ error: error.message || 'Erreur lors du résumé.' });
+  }
+});
+
 // ===== Generate podcast from existing translated text =====
 app.post('/api/generate-podcast', requireAuth, requireQuota, async (req, res) => {
   const user = (req as any).dbUser;
@@ -802,7 +879,8 @@ app.post('/api/generate-podcast', requireAuth, requireQuota, async (req, res) =>
     });
   }
 
-  const { translatedText } = req.body;
+  const { translatedText, podcastTone, podcastSpeakerCount, podcastVoiceConfig } = req.body;
+  const podcastOpts = { tone: podcastTone, speakerCount: podcastSpeakerCount, voiceConfig: podcastVoiceConfig };
 
   res.setHeader('Content-Type', 'text/event-stream');
   res.setHeader('Cache-Control', 'no-cache');
@@ -817,7 +895,7 @@ app.post('/api/generate-podcast', requireAuth, requireQuota, async (req, res) =>
 
   try {
     const filePrefix = `podcast_${Date.now()}`;
-    const audioUrl = await podcastPipeline(res, translatedText, filePrefix);
+    const audioUrl = await podcastPipeline(res, translatedText, filePrefix, podcastOpts);
 
     // Record usage
     const estimatedDuration = Math.ceil(translatedText.length / 15);

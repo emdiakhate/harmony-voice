@@ -13,27 +13,156 @@ const GEMINI_MODEL = 'gemini-2.5-flash-preview-tts';
 const GEMINI_API_URL = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent`;
 const MAX_GEMINI_CHARS = 8000;
 
-// Gemini multi-speaker voice config
-const SPEAKER_VOICES = {
+// Available voice presets for user selection
+export const AVAILABLE_VOICES = {
+  gemini: [
+    { id: 'Charon', label: 'Charon (Homme grave)', gender: 'M' },
+    { id: 'Kore', label: 'Kore (Femme douce)', gender: 'F' },
+    { id: 'Fenrir', label: 'Fenrir (Homme dynamique)', gender: 'M' },
+    { id: 'Aoede', label: 'Aoede (Femme vive)', gender: 'F' },
+    { id: 'Puck', label: 'Puck (Homme léger)', gender: 'M' },
+    { id: 'Leda', label: 'Leda (Femme chaleureuse)', gender: 'F' },
+  ],
+  openai: [
+    { id: 'onyx', label: 'Onyx (Homme grave)', gender: 'M' },
+    { id: 'nova', label: 'Nova (Femme douce)', gender: 'F' },
+    { id: 'echo', label: 'Echo (Homme clair)', gender: 'M' },
+    { id: 'shimmer', label: 'Shimmer (Femme vive)', gender: 'F' },
+    { id: 'fable', label: 'Fable (Homme narrateur)', gender: 'M' },
+    { id: 'alloy', label: 'Alloy (Neutre)', gender: 'N' },
+  ],
+  elevenlabs: [
+    { id: 'EXAVITQu4vr4xnSDxMaL', label: 'Sarah (Femme)', gender: 'F' },
+    { id: 'LivlNOmp4OEi5jd1LlSU', label: 'Daniel (Homme)', gender: 'M' },
+    { id: 'jBpfuIE2acCO8z3wKNLl', label: 'Emily (Femme vive)', gender: 'F' },
+    { id: 'onwK4e9ZLuTAKqWW03F9', label: 'Marcus (Homme grave)', gender: 'M' },
+  ],
+};
+
+// Default voice assignments per speaker (up to 4 speakers)
+const DEFAULT_GEMINI_VOICES: Record<string, { voiceName: string }> = {
   'Speaker 1': { voiceName: 'Charon' },
   'Speaker 2': { voiceName: 'Kore' },
+  'Speaker 3': { voiceName: 'Fenrir' },
+  'Speaker 4': { voiceName: 'Aoede' },
 };
 
-// ElevenLabs fallback voices
-const ELEVENLABS_VOICES: Record<string, string> = {
-  'Speaker 1': 'EXAVITQu4vr4xnSDxMaL', // Sarah - female voice
-  'Speaker 2': 'LivlNOmp4OEi5jd1LlSU', // second voice
+const DEFAULT_ELEVENLABS_VOICES: Record<string, string> = {
+  'Speaker 1': 'EXAVITQu4vr4xnSDxMaL',
+  'Speaker 2': 'LivlNOmp4OEi5jd1LlSU',
+  'Speaker 3': 'jBpfuIE2acCO8z3wKNLl',
+  'Speaker 4': 'onwK4e9ZLuTAKqWW03F9',
 };
 
-// OpenAI fallback voices
-const OPENAI_VOICES: Record<string, 'onyx' | 'nova'> = {
+const DEFAULT_OPENAI_VOICES: Record<string, string> = {
   'Speaker 1': 'onyx',
   'Speaker 2': 'nova',
+  'Speaker 3': 'echo',
+  'Speaker 4': 'shimmer',
 };
+
+export interface PodcastVoiceConfig {
+  [speaker: string]: string; // speaker label -> voice id
+}
+
+// Jingle / transition configuration
+const JINGLE_INTRO_TEXT = '♪ ♪ ♪';
+const TRANSITION_SILENCE_MS = 800; // 0.8 second silence between segments
 
 interface PodcastTTSResult {
   audioBuffer: Buffer;
   provider: 'gemini' | 'elevenlabs' | 'openai' | 'piper';
+}
+
+/**
+ * Generate a short silence buffer (MP3) for transitions between segments.
+ */
+async function generateSilenceBuffer(durationMs: number): Promise<Buffer> {
+  const tmpDir = os.tmpdir();
+  const silencePath = path.join(tmpDir, `silence_${Date.now()}.mp3`);
+
+  try {
+    await execFileAsync('ffmpeg', [
+      '-f', 'lavfi',
+      '-i', `anullsrc=r=24000:cl=mono`,
+      '-t', (durationMs / 1000).toString(),
+      '-codec:a', 'libmp3lame',
+      '-qscale:a', '9',
+      '-y',
+      silencePath,
+    ], { timeout: 10000 });
+
+    const buffer = fs.readFileSync(silencePath);
+    return buffer;
+  } catch {
+    // Fallback: return an empty buffer (no transition)
+    return Buffer.alloc(0);
+  } finally {
+    try { fs.unlinkSync(silencePath); } catch {}
+  }
+}
+
+/**
+ * Generate a simple jingle tone (intro/outro) using ffmpeg.
+ */
+async function generateJingleBuffer(type: 'intro' | 'outro' | 'transition'): Promise<Buffer> {
+  const tmpDir = os.tmpdir();
+  const jinglePath = path.join(tmpDir, `jingle_${type}_${Date.now()}.mp3`);
+
+  // Different tones for intro/outro/transition
+  const configs: Record<string, { freqs: string; duration: string }> = {
+    intro: {
+      freqs: 'sine=frequency=523:duration=0.2,sine=frequency=659:duration=0.2,sine=frequency=784:duration=0.3',
+      duration: '1.5',
+    },
+    outro: {
+      freqs: 'sine=frequency=784:duration=0.2,sine=frequency=659:duration=0.2,sine=frequency=523:duration=0.4',
+      duration: '1.5',
+    },
+    transition: {
+      freqs: 'sine=frequency=440:duration=0.15,sine=frequency=554:duration=0.15',
+      duration: '0.8',
+    },
+  };
+
+  const config = configs[type];
+
+  try {
+    // Generate a simple ascending/descending tone sequence
+    const filterParts = config.freqs.split(',');
+    const inputs: string[] = [];
+    const filterInputs: string[] = [];
+
+    filterParts.forEach((part, i) => {
+      inputs.push('-f', 'lavfi', '-i', part);
+      filterInputs.push(`[${i}]`);
+    });
+
+    // Add a small silence padding
+    inputs.push('-f', 'lavfi', '-i', `anullsrc=r=44100:cl=mono:d=0.3`);
+    filterInputs.push(`[${filterParts.length}]`);
+
+    const filterComplex = `${filterInputs.join('')}concat=n=${filterInputs.length}:v=0:a=1,volume=0.3[out]`;
+
+    await execFileAsync('ffmpeg', [
+      ...inputs,
+      '-filter_complex', filterComplex,
+      '-map', '[out]',
+      '-codec:a', 'libmp3lame',
+      '-qscale:a', '5',
+      '-y',
+      jinglePath,
+    ], { timeout: 15000 });
+
+    const buffer = fs.readFileSync(jinglePath);
+    return buffer;
+  } catch (error: any) {
+    console.warn(`[Jingle] Failed to generate ${type} jingle:`, error.message);
+    // Fallback: return silence
+    return generateSilenceBuffer(type === 'transition' ? 500 : 1000);
+  } finally {
+    try { fs.unlinkSync(jinglePath); } catch {}
+  }
 }
 
 /**
@@ -43,15 +172,37 @@ interface PodcastTTSResult {
 export async function generatePodcastAudio(
   script: string,
   onProgress?: (progress: number, message: string, provider?: string) => void,
+  voiceConfig?: PodcastVoiceConfig,
 ): Promise<PodcastTTSResult> {
+  // Generate jingles
+  onProgress?.(0, 'Génération des jingles...', 'jingle');
+  let introJingle: Buffer;
+  let outroJingle: Buffer;
+  let transitionJingle: Buffer;
+  try {
+    [introJingle, outroJingle, transitionJingle] = await Promise.all([
+      generateJingleBuffer('intro'),
+      generateJingleBuffer('outro'),
+      generateJingleBuffer('transition'),
+    ]);
+    console.log(`[PodcastTTS] Jingles generated: intro=${introJingle.length}B, outro=${outroJingle.length}B, transition=${transitionJingle.length}B`);
+  } catch {
+    introJingle = Buffer.alloc(0);
+    outroJingle = Buffer.alloc(0);
+    transitionJingle = Buffer.alloc(0);
+  }
+
+  let coreAudio: Buffer | null = null;
+  let provider: PodcastTTSResult['provider'] = 'openai';
+
   // 1. Try Gemini multi-speaker TTS
-  if (process.env.GOOGLE_API_KEY) {
+  if (!coreAudio && process.env.GOOGLE_API_KEY) {
     try {
       console.log('[PodcastTTS] Attempting Gemini multi-speaker TTS...');
-      onProgress?.(0, 'Génération avec Gemini...', 'gemini');
-      const audioBuffer = await generateWithGemini(script, process.env.GOOGLE_API_KEY, onProgress);
-      console.log(`[PodcastTTS] Gemini success: ${(audioBuffer.length / 1024 / 1024).toFixed(2)}MB`);
-      return { audioBuffer, provider: 'gemini' };
+      onProgress?.(5, 'Génération avec Gemini...', 'gemini');
+      coreAudio = await generateWithGemini(script, process.env.GOOGLE_API_KEY, onProgress, voiceConfig);
+      provider = 'gemini';
+      console.log(`[PodcastTTS] Gemini success: ${(coreAudio.length / 1024 / 1024).toFixed(2)}MB`);
     } catch (error: any) {
       logGeminiError(error);
       console.log('[PodcastTTS] Gemini failed, trying next provider...');
@@ -59,13 +210,13 @@ export async function generatePodcastAudio(
   }
 
   // 2. Try ElevenLabs multi-voice TTS
-  if (process.env.ELEVENLABS_API_KEY) {
+  if (!coreAudio && process.env.ELEVENLABS_API_KEY) {
     try {
       console.log('[PodcastTTS] Attempting ElevenLabs multi-voice TTS...');
-      onProgress?.(0, 'Génération avec ElevenLabs...', 'elevenlabs');
-      const audioBuffer = await generateWithElevenLabs(script, onProgress);
-      console.log(`[PodcastTTS] ElevenLabs success: ${(audioBuffer.length / 1024 / 1024).toFixed(2)}MB`);
-      return { audioBuffer, provider: 'elevenlabs' };
+      onProgress?.(5, 'Génération avec ElevenLabs...', 'elevenlabs');
+      coreAudio = await generateWithElevenLabs(script, onProgress, voiceConfig);
+      provider = 'elevenlabs';
+      console.log(`[PodcastTTS] ElevenLabs success: ${(coreAudio.length / 1024 / 1024).toFixed(2)}MB`);
     } catch (error: any) {
       console.error('[PodcastTTS] ElevenLabs error:', error.message);
       console.log('[PodcastTTS] ElevenLabs failed, trying next provider...');
@@ -73,32 +224,43 @@ export async function generatePodcastAudio(
   }
 
   // 3. Fallback: OpenAI TTS
-  if (process.env.OPENAI_API_KEY) {
+  if (!coreAudio && process.env.OPENAI_API_KEY) {
     try {
       console.log('[PodcastTTS] Using OpenAI TTS fallback...');
-      onProgress?.(0, 'Génération avec OpenAI...', 'openai');
-      const audioBuffer = await generateWithOpenAI(script, onProgress);
-      console.log(`[PodcastTTS] OpenAI fallback success: ${(audioBuffer.length / 1024 / 1024).toFixed(2)}MB`);
-      return { audioBuffer, provider: 'openai' };
+      onProgress?.(5, 'Génération avec OpenAI...', 'openai');
+      coreAudio = await generateWithOpenAI(script, onProgress, voiceConfig);
+      provider = 'openai';
+      console.log(`[PodcastTTS] OpenAI fallback success: ${(coreAudio.length / 1024 / 1024).toFixed(2)}MB`);
     } catch (error: any) {
       console.error('[PodcastTTS] OpenAI error:', error.message);
     }
   }
 
-  // 4. Piper TTS — local, free, two voices for podcast
-  if (isPiperAvailable() && hasVoiceForLang('fr')) {
+  // 4. Piper TTS — local, free
+  if (!coreAudio && isPiperAvailable() && hasVoiceForLang('fr')) {
     try {
       console.log('[PodcastTTS] Attempting Piper TTS (local)...');
-      onProgress?.(0, 'Génération avec Piper (local)...', 'piper');
-      const audioBuffer = await generatePodcastWithPiper(script, onProgress);
-      console.log(`[PodcastTTS] Piper success: ${(audioBuffer.length / 1024 / 1024).toFixed(2)}MB`);
-      return { audioBuffer, provider: 'piper' };
+      onProgress?.(5, 'Génération avec Piper (local)...', 'piper');
+      coreAudio = await generatePodcastWithPiper(script, onProgress);
+      provider = 'piper';
+      console.log(`[PodcastTTS] Piper success: ${(coreAudio.length / 1024 / 1024).toFixed(2)}MB`);
     } catch (error: any) {
       console.error('[PodcastTTS] Piper error:', error.message);
     }
   }
 
-  throw new Error('Aucun provider Podcast TTS disponible. Configurez GOOGLE_API_KEY, ELEVENLABS_API_KEY, OPENAI_API_KEY ou installez Piper.');
+  if (!coreAudio) {
+    throw new Error('Aucun provider Podcast TTS disponible. Configurez GOOGLE_API_KEY, ELEVENLABS_API_KEY, OPENAI_API_KEY ou installez Piper.');
+  }
+
+  // Assemble: intro jingle + core audio + outro jingle
+  const finalParts: Buffer[] = [];
+  if (introJingle.length > 0) finalParts.push(introJingle);
+  finalParts.push(coreAudio);
+  if (outroJingle.length > 0) finalParts.push(outroJingle);
+
+  const audioBuffer = Buffer.concat(finalParts);
+  return { audioBuffer, provider };
 }
 
 /**
@@ -148,7 +310,7 @@ function chunkScript(script: string): string[] {
   let current = '';
 
   for (const line of lines) {
-    const isSpeakerLine = /^Speaker [12]:/.test(line);
+    const isSpeakerLine = /^Speaker \d+:/.test(line);
 
     if (isSpeakerLine && (current + '\n' + line).length > MAX_GEMINI_CHARS && current.length > 0) {
       chunks.push(current.trim());
@@ -170,6 +332,7 @@ async function generateWithGemini(
   script: string,
   apiKey: string,
   onProgress?: (progress: number, message: string) => void,
+  voiceConfig?: PodcastVoiceConfig,
 ): Promise<Buffer> {
   const chunks = chunkScript(script);
   console.log(`[PodcastTTS] Gemini: ${chunks.length} chunk(s) to process`);
@@ -196,8 +359,21 @@ async function generateWithGemini(
 /**
  * Call Gemini TTS API for a single chunk with multi-speaker config.
  */
-async function callGeminiTTS(text: string, apiKey: string): Promise<Buffer> {
+async function callGeminiTTS(text: string, apiKey: string, voiceConfig?: PodcastVoiceConfig): Promise<Buffer> {
   const url = `${GEMINI_API_URL}?key=${apiKey}`;
+
+  // Build speaker configs from voiceConfig or defaults
+  const speakerNumbers = text.match(/Speaker \d+/g) || ['Speaker 1', 'Speaker 2'];
+  const uniqueSpeakers = [...new Set(speakerNumbers)];
+
+  const speakerVoiceConfigs = uniqueSpeakers.map(speaker => ({
+    speaker,
+    voiceConfig: {
+      prebuiltVoiceConfig: {
+        voiceName: voiceConfig?.[speaker] || DEFAULT_GEMINI_VOICES[speaker]?.voiceName || 'Charon',
+      },
+    },
+  }));
 
   const body = {
     contents: [
@@ -209,10 +385,7 @@ async function callGeminiTTS(text: string, apiKey: string): Promise<Buffer> {
       responseModalities: ['AUDIO'],
       speechConfig: {
         multiSpeakerVoiceConfig: {
-          speakerVoiceConfigs: [
-            { speaker: 'Speaker 1', voiceConfig: { prebuiltVoiceConfig: SPEAKER_VOICES['Speaker 1'] } },
-            { speaker: 'Speaker 2', voiceConfig: { prebuiltVoiceConfig: SPEAKER_VOICES['Speaker 2'] } },
-          ],
+          speakerVoiceConfigs,
         },
       },
     },
@@ -279,17 +452,24 @@ async function pcmToMp3(pcmBuffer: Buffer): Promise<Buffer> {
 async function generateWithElevenLabs(
   script: string,
   onProgress?: (progress: number, message: string, provider?: string) => void,
+  voiceConfig?: PodcastVoiceConfig,
 ): Promise<Buffer> {
   const elevenlabs = new ElevenLabsClient({ apiKey: process.env.ELEVENLABS_API_KEY });
 
   const segments = parseScriptSegments(script);
   console.log(`[PodcastTTS] ElevenLabs: ${segments.length} segments`);
 
+  const transitionSilence = await generateSilenceBuffer(TRANSITION_SILENCE_MS);
   const audioBuffers: Buffer[] = [];
 
   for (let i = 0; i < segments.length; i++) {
+    // Add transition silence between segments
+    if (i > 0 && transitionSilence.length > 0) {
+      audioBuffers.push(transitionSilence);
+    }
+
     const { speaker, text } = segments[i];
-    const voiceId = ELEVENLABS_VOICES[speaker] || ELEVENLABS_VOICES['Speaker 1'];
+    const voiceId = voiceConfig?.[speaker] || DEFAULT_ELEVENLABS_VOICES[speaker] || DEFAULT_ELEVENLABS_VOICES['Speaker 1'];
 
     onProgress?.(
       Math.round((i / segments.length) * 100),
@@ -324,6 +504,7 @@ async function generateWithElevenLabs(
 async function generateWithOpenAI(
   script: string,
   onProgress?: (progress: number, message: string) => void,
+  voiceConfig?: PodcastVoiceConfig,
 ): Promise<Buffer> {
   const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
@@ -331,11 +512,17 @@ async function generateWithOpenAI(
   const segments = parseScriptSegments(script);
   console.log(`[PodcastTTS] OpenAI fallback: ${segments.length} segments`);
 
+  const transitionSilence = await generateSilenceBuffer(TRANSITION_SILENCE_MS);
   const audioBuffers: Buffer[] = [];
 
   for (let i = 0; i < segments.length; i++) {
+    // Add transition silence between segments
+    if (i > 0 && transitionSilence.length > 0) {
+      audioBuffers.push(transitionSilence);
+    }
+
     const { speaker, text } = segments[i];
-    const voice = OPENAI_VOICES[speaker] || 'nova';
+    const voice = (voiceConfig?.[speaker] || DEFAULT_OPENAI_VOICES[speaker] || 'nova') as any;
 
     onProgress?.(
       Math.round((i / segments.length) * 100),
@@ -371,7 +558,7 @@ function parseScriptSegments(script: string): Array<{ speaker: string; text: str
   let currentText = '';
 
   for (const line of lines) {
-    const speakerMatch = line.match(/^(Speaker [12]):\s*(.*)/);
+    const speakerMatch = line.match(/^(Speaker \d+):\s*(.*)/);
 
     if (speakerMatch) {
       // Save previous segment
