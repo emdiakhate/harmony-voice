@@ -38,3 +38,9 @@ server/piper/
 /generated/prisma
 *.db
 *.db-journal
+
+# Claude Code (état local de l'agent)
+.claude/
+
+# Artefacts de test
+test.wav
