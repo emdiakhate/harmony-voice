@@ -6,6 +6,7 @@ import path from 'path';
 import { exec, execFile } from 'child_process';
 import { promisify } from 'util';
 import { isPiperAvailable, hasVoiceForLang, generateLongTextWithPiper } from './piper-tts.js';
+import { resolveTtsConfig, runWithFallback, type Attempt, type LlmConfigInput } from './llm/router.js';
 
 const execAsync = promisify(exec);
 const execFileAsync = promisify(execFile);
@@ -46,99 +47,30 @@ export function splitForTTS(text: string): string[] {
 }
 
 /**
- * TTS provider priority: ElevenLabs > OpenAI > Gemini > Piper (local) > Edge TTS (free) > Google Translate TTS
- * Falls back through providers on quota errors.
- * Once a provider fails with quota, it's disabled for the rest of the server session.
+ * TTS provider priority: (clés user > repli .env, ordre défini par l'utilisateur)
+ * ElevenLabs / OpenAI / Gemini  →  puis fallbacks gratuits Piper (local) > Edge TTS > Google Translate TTS.
+ *
+ * Les fournisseurs à clé passent par le routeur + ledger (cooldown sur 429/quota au lieu
+ * d'un flag « disabled » global), ce qui permet d'utiliser plusieurs clés et de respecter
+ * la priorité choisie dans les Paramètres.
  */
-let elevenLabsDisabled = false;
-let openAITTSDisabled = false;
-let geminiTTSDisabled = false;
-
-export async function generateSpeechChunk(text: string): Promise<Buffer> {
-  // 1. Try ElevenLabs first (unless previously disabled)
-  if (process.env.ELEVENLABS_API_KEY && !elevenLabsDisabled) {
+export async function generateSpeechChunk(text: string, ttsConfig?: LlmConfigInput | null): Promise<Buffer> {
+  // 1. Fournisseurs à clé (ElevenLabs / OpenAI / Gemini), failover via ledger.
+  const attempts = resolveTtsConfig(ttsConfig);
+  if (attempts.length > 0) {
     try {
-      console.log('[TTS] Using ElevenLabs (eleven_multilingual_v2)');
-      const elevenlabs = new ElevenLabsClient({ apiKey: process.env.ELEVENLABS_API_KEY });
-      const audio = await elevenlabs.textToSpeech.convert(
-        'EXAVITQu4vr4xnSDxMaL', // "Sarah" - clear female voice
-        {
-          text,
-          modelId: 'eleven_multilingual_v2',
-          outputFormat: 'mp3_44100_128',
-        }
-      );
-      const chunks: Uint8Array[] = [];
-      for await (const chunk of audio) {
-        chunks.push(chunk);
-      }
-      return Buffer.concat(chunks);
-    } catch (err: any) {
-      const status = err?.status || err?.statusCode;
-      const isQuotaExceeded = err?.body?.detail?.status === 'quota_exceeded';
-      if (status === 429 || (status === 401 && isQuotaExceeded)) {
-        console.warn('[TTS] ElevenLabs quota exceeded, disabling. Trying next provider...');
-        elevenLabsDisabled = true;
-      } else {
-        throw err;
-      }
-    }
-  }
-
-  // 2. Try OpenAI TTS (unless previously disabled)
-  if (process.env.OPENAI_API_KEY && !openAITTSDisabled) {
-    try {
-      console.log('[TTS] Using OpenAI TTS (tts-1, nova)');
-      const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
-      const response = await openai.audio.speech.create({
-        model: 'tts-1',
-        voice: 'nova',
-        input: text,
-        response_format: 'mp3',
+      return await runWithFallback<Buffer>({
+        attempts,
+        label: 'TTS',
+        isEmpty: (b) => !b || b.length === 0,
+        run: (a) => callKeyedTTS(a, text),
       });
-      return Buffer.from(await response.arrayBuffer());
     } catch (err: any) {
-      const status = err?.status || err?.statusCode;
-      if (status === 429) {
-        console.warn('[TTS] OpenAI TTS quota exceeded, disabling. Trying next provider...');
-        openAITTSDisabled = true;
-      } else {
-        throw err;
-      }
+      console.warn(`[TTS] Tous les fournisseurs à clé ont échoué (${err?.message || err}). Passage aux fallbacks gratuits...`);
     }
   }
 
-  // 3. Fallback: Gemini TTS with retry (single-speaker mode)
-  if (process.env.GOOGLE_API_KEY && !geminiTTSDisabled) {
-    const MAX_RETRIES = 2;
-    for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
-      try {
-        console.log(`[TTS] Using Gemini TTS fallback (gemini-2.5-flash-preview-tts)${attempt > 0 ? ` [retry ${attempt}/${MAX_RETRIES}]` : ''}`);
-        return await generateWithGemini(text, process.env.GOOGLE_API_KEY);
-      } catch (err: any) {
-        const status = err?.status;
-        if (status === 429) {
-          console.warn('[TTS] Gemini TTS quota exceeded, disabling.');
-          geminiTTSDisabled = true;
-          break;
-        }
-        if (status === 500 || status === 503) {
-          if (attempt < MAX_RETRIES) {
-            const delay = (attempt + 1) * 2000;
-            console.warn(`[TTS] Gemini TTS error ${status}, retrying in ${delay / 1000}s...`);
-            await new Promise(r => setTimeout(r, delay));
-            continue;
-          }
-          console.warn(`[TTS] Gemini TTS failed after ${MAX_RETRIES + 1} attempts, disabling.`);
-          geminiTTSDisabled = true;
-          break;
-        }
-        throw err;
-      }
-    }
-  }
-
-  // 4. Piper TTS — local, free, high quality
+  // 2. Piper TTS — local, free, high quality
   if (isPiperAvailable() && hasVoiceForLang(edgeTTSLang)) {
     try {
       console.log(`[TTS] Using Piper TTS (local, lang=${edgeTTSLang})`);
@@ -151,7 +83,7 @@ export async function generateSpeechChunk(text: string): Promise<Buffer> {
     console.warn(`[TTS] Piper TTS skipped (${reason}). Install Piper for better free TTS quality.`);
   }
 
-  // 5. Edge TTS — free, good quality, Microsoft Azure voices via edge-tts CLI
+  // 3. Edge TTS — free, good quality, Microsoft Azure voices via edge-tts CLI
   try {
     console.log(`[TTS] Using Edge TTS fallback (free, lang=${edgeTTSLang})`);
     return await generateWithEdgeTTS(text, edgeTTSLang);
@@ -159,7 +91,7 @@ export async function generateSpeechChunk(text: string): Promise<Buffer> {
     console.error(`[TTS] Edge TTS failed: ${err?.message || err}`);
   }
 
-  // 6. Ultimate fallback: Google Translate TTS (free, no API key needed, lower quality)
+  // 4. Ultimate fallback: Google Translate TTS (free, no API key needed, lower quality)
   try {
     console.log(`[TTS] Using Google Translate TTS fallback (free, lang=${edgeTTSLang})`);
     return await generateWithGoogleTTS(text, edgeTTSLang);
@@ -168,6 +100,50 @@ export async function generateSpeechChunk(text: string): Promise<Buffer> {
   }
 
   throw new Error('Aucun provider TTS disponible. Tous les providers ont échoué ou sont désactivés.');
+}
+
+/**
+ * Dispatch d'un essai TTS « à clé » vers le bon fournisseur (utilisé par le routeur).
+ */
+async function callKeyedTTS(attempt: Attempt, text: string): Promise<Buffer> {
+  switch (attempt.def.id) {
+    case 'elevenlabs':
+      return ttsWithElevenLabs(attempt.apiKey, text);
+    case 'openai':
+      return ttsWithOpenAI(attempt.apiKey, text);
+    case 'gemini':
+      return generateWithGemini(text, attempt.apiKey);
+    default:
+      throw new Error(`Fournisseur TTS non supporté: ${attempt.def.id}`);
+  }
+}
+
+async function ttsWithElevenLabs(apiKey: string, text: string): Promise<Buffer> {
+  const elevenlabs = new ElevenLabsClient({ apiKey });
+  const audio = await elevenlabs.textToSpeech.convert(
+    'EXAVITQu4vr4xnSDxMaL', // "Sarah" - clear female voice
+    {
+      text,
+      modelId: 'eleven_multilingual_v2',
+      outputFormat: 'mp3_44100_128',
+    }
+  );
+  const chunks: Uint8Array[] = [];
+  for await (const chunk of audio) {
+    chunks.push(chunk);
+  }
+  return Buffer.concat(chunks);
+}
+
+async function ttsWithOpenAI(apiKey: string, text: string): Promise<Buffer> {
+  const openai = new OpenAI({ apiKey });
+  const response = await openai.audio.speech.create({
+    model: 'tts-1',
+    voice: 'nova',
+    input: text,
+    response_format: 'mp3',
+  });
+  return Buffer.from(await response.arrayBuffer());
 }
 
 /**
@@ -392,7 +368,8 @@ async function pcmToMp3(pcmBuffer: Buffer): Promise<Buffer> {
 export async function generateSpeech(
   text: string,
   outputPath: string,
-  onProgress?: (progress: number) => void
+  onProgress?: (progress: number) => void,
+  ttsConfig?: LlmConfigInput | null,
 ): Promise<void> {
   const chunks = splitForTTS(text);
   const audioBuffers: Buffer[] = [];
@@ -400,7 +377,7 @@ export async function generateSpeech(
   console.log(`[TTS] Generating audio for ${chunks.length} chunks (${text.length} chars total)`);
 
   for (let i = 0; i < chunks.length; i++) {
-    const buffer = await generateSpeechChunk(chunks[i]);
+    const buffer = await generateSpeechChunk(chunks[i], ttsConfig);
     audioBuffers.push(buffer);
     onProgress?.(Math.round(((i + 1) / chunks.length) * 100));
   }

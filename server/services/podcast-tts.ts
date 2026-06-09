@@ -6,6 +6,7 @@ import path from 'path';
 import { execFile } from 'child_process';
 import { promisify } from 'util';
 import { isPiperAvailable, hasVoiceForLang, generateLongTextWithPiper } from './piper-tts.js';
+import { resolveTtsConfig, runWithFallback, type Attempt, type LlmConfigInput } from './llm/router.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -173,6 +174,7 @@ export async function generatePodcastAudio(
   script: string,
   onProgress?: (progress: number, message: string, provider?: string) => void,
   voiceConfig?: PodcastVoiceConfig,
+  ttsConfig?: LlmConfigInput | null,
 ): Promise<PodcastTTSResult> {
   // Generate jingles
   onProgress?.(0, 'Génération des jingles...', 'jingle');
@@ -195,48 +197,33 @@ export async function generatePodcastAudio(
   let coreAudio: Buffer | null = null;
   let provider: PodcastTTSResult['provider'] = 'openai';
 
-  // 1. Try Gemini multi-speaker TTS
-  if (!coreAudio && process.env.GOOGLE_API_KEY) {
+  // 1. Fournisseurs à clé (clés user injectées depuis la DB > repli .env), routés via le ledger.
+  // Pour le podcast, Gemini fait du multi-speaker natif → on le privilégie s'il est présent.
+  const resolved = resolveTtsConfig(ttsConfig);
+  const attempts = [
+    ...resolved.filter((a) => a.def.id === 'gemini'),
+    ...resolved.filter((a) => a.def.id !== 'gemini'),
+  ];
+  if (attempts.length > 0) {
     try {
-      console.log('[PodcastTTS] Attempting Gemini multi-speaker TTS...');
-      onProgress?.(5, 'Génération avec Gemini...', 'gemini');
-      coreAudio = await generateWithGemini(script, process.env.GOOGLE_API_KEY, onProgress, voiceConfig);
-      provider = 'gemini';
-      console.log(`[PodcastTTS] Gemini success: ${(coreAudio.length / 1024 / 1024).toFixed(2)}MB`);
-    } catch (error: any) {
-      logGeminiError(error);
-      console.log('[PodcastTTS] Gemini failed, trying next provider...');
+      const result = await runWithFallback<{ buffer: Buffer; provider: PodcastTTSResult['provider'] }>({
+        attempts,
+        label: 'PodcastTTS',
+        isEmpty: (r) => !r.buffer || r.buffer.length === 0,
+        run: async (a) => {
+          onProgress?.(5, `Génération avec ${a.def.label}...`, a.def.id);
+          const buffer = await callKeyedPodcastTTS(a, script, onProgress, voiceConfig);
+          return { buffer, provider: a.def.id as PodcastTTSResult['provider'] };
+        },
+      });
+      coreAudio = result.buffer;
+      provider = result.provider;
+    } catch (err: any) {
+      console.warn(`[PodcastTTS] Tous les fournisseurs à clé ont échoué (${err?.message || err}). Fallback Piper...`);
     }
   }
 
-  // 2. Try ElevenLabs multi-voice TTS
-  if (!coreAudio && process.env.ELEVENLABS_API_KEY) {
-    try {
-      console.log('[PodcastTTS] Attempting ElevenLabs multi-voice TTS...');
-      onProgress?.(5, 'Génération avec ElevenLabs...', 'elevenlabs');
-      coreAudio = await generateWithElevenLabs(script, onProgress, voiceConfig);
-      provider = 'elevenlabs';
-      console.log(`[PodcastTTS] ElevenLabs success: ${(coreAudio.length / 1024 / 1024).toFixed(2)}MB`);
-    } catch (error: any) {
-      console.error('[PodcastTTS] ElevenLabs error:', error.message);
-      console.log('[PodcastTTS] ElevenLabs failed, trying next provider...');
-    }
-  }
-
-  // 3. Fallback: OpenAI TTS
-  if (!coreAudio && process.env.OPENAI_API_KEY) {
-    try {
-      console.log('[PodcastTTS] Using OpenAI TTS fallback...');
-      onProgress?.(5, 'Génération avec OpenAI...', 'openai');
-      coreAudio = await generateWithOpenAI(script, onProgress, voiceConfig);
-      provider = 'openai';
-      console.log(`[PodcastTTS] OpenAI fallback success: ${(coreAudio.length / 1024 / 1024).toFixed(2)}MB`);
-    } catch (error: any) {
-      console.error('[PodcastTTS] OpenAI error:', error.message);
-    }
-  }
-
-  // 4. Piper TTS — local, free
+  // 2. Piper TTS — local, free
   if (!coreAudio && isPiperAvailable() && hasVoiceForLang('fr')) {
     try {
       console.log('[PodcastTTS] Attempting Piper TTS (local)...');
@@ -250,7 +237,7 @@ export async function generatePodcastAudio(
   }
 
   if (!coreAudio) {
-    throw new Error('Aucun provider Podcast TTS disponible. Configurez GOOGLE_API_KEY, ELEVENLABS_API_KEY, OPENAI_API_KEY ou installez Piper.');
+    throw new Error('Aucun provider Podcast TTS disponible. Ajoutez une clé (Gemini/ElevenLabs/OpenAI) dans les Paramètres ou installez Piper.');
   }
 
   // Assemble: intro jingle + core audio + outro jingle
@@ -328,6 +315,25 @@ function chunkScript(script: string): string[] {
 /**
  * Generate audio with Gemini 2.5 Flash TTS multi-speaker.
  */
+/** Dispatch d'un essai podcast TTS « à clé » vers le bon fournisseur multi-speaker. */
+function callKeyedPodcastTTS(
+  attempt: Attempt,
+  script: string,
+  onProgress?: (progress: number, message: string, provider?: string) => void,
+  voiceConfig?: PodcastVoiceConfig,
+): Promise<Buffer> {
+  switch (attempt.def.id) {
+    case 'gemini':
+      return generateWithGemini(script, attempt.apiKey, onProgress, voiceConfig);
+    case 'elevenlabs':
+      return generateWithElevenLabs(script, attempt.apiKey, onProgress, voiceConfig);
+    case 'openai':
+      return generateWithOpenAI(script, attempt.apiKey, onProgress, voiceConfig);
+    default:
+      throw new Error(`Fournisseur Podcast TTS non supporté: ${attempt.def.id}`);
+  }
+}
+
 async function generateWithGemini(
   script: string,
   apiKey: string,
@@ -451,10 +457,11 @@ async function pcmToMp3(pcmBuffer: Buffer): Promise<Buffer> {
  */
 async function generateWithElevenLabs(
   script: string,
+  apiKey: string,
   onProgress?: (progress: number, message: string, provider?: string) => void,
   voiceConfig?: PodcastVoiceConfig,
 ): Promise<Buffer> {
-  const elevenlabs = new ElevenLabsClient({ apiKey: process.env.ELEVENLABS_API_KEY });
+  const elevenlabs = new ElevenLabsClient({ apiKey });
 
   const segments = parseScriptSegments(script);
   console.log(`[PodcastTTS] ElevenLabs: ${segments.length} segments`);
@@ -503,10 +510,11 @@ async function generateWithElevenLabs(
  */
 async function generateWithOpenAI(
   script: string,
+  apiKey: string,
   onProgress?: (progress: number, message: string) => void,
   voiceConfig?: PodcastVoiceConfig,
 ): Promise<Buffer> {
-  const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+  const openai = new OpenAI({ apiKey });
 
   // Parse script into speaker segments
   const segments = parseScriptSegments(script);

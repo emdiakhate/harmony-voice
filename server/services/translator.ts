@@ -1,5 +1,4 @@
-import OpenAI from 'openai';
-import Groq from 'groq-sdk';
+import { chatComplete, resolveLlmConfig, describeChain, type LlmConfigInput } from './llm/router.js';
 
 const LANGUAGE_NAMES: Record<string, string> = {
   fr: 'French',
@@ -17,8 +16,6 @@ const LANGUAGE_NAMES: Record<string, string> = {
 };
 
 const CHUNK_SIZE = 3000;
-
-type Provider = 'groq' | 'openrouter' | 'openai';
 
 function splitTextIntoChunks(text: string, maxLength: number): string[] {
   const sentences = text.split(/(?<=[.!?])\s+/);
@@ -46,25 +43,6 @@ function splitTextIntoChunks(text: string, maxLength: number): string[] {
   return chunks;
 }
 
-/**
- * Get ordered list of available providers.
- * Priority: Groq > OpenRouter > OpenAI
- */
-function getAvailableProviders(): Provider[] {
-  const providers: Provider[] = [];
-  if (process.env.GROQ_API_KEY) providers.push('groq');
-  if (process.env.OPENROUTER_API_KEY) providers.push('openrouter');
-  if (process.env.OPENAI_API_KEY) providers.push('openai');
-  return providers;
-}
-
-function isRateLimitError(error: any): boolean {
-  if (error?.status === 429) return true;
-  if (error?.statusCode === 429) return true;
-  const msg = error?.message || error?.error?.message || '';
-  return msg.includes('rate_limit') || msg.includes('Rate limit') || msg.includes('429');
-}
-
 interface TranslateCallbacks {
   onProgress?: (progress: number) => void;
   onPartialResult?: (partialText: string, progress: number) => void;
@@ -73,142 +51,83 @@ interface TranslateCallbacks {
 }
 
 /**
- * Detect the language of a text sample using the first available LLM provider.
+ * Detect the language of a text sample via the LLM router.
  * Returns ISO 639-1 code (e.g. 'fr', 'en', 'es') or 'unknown'.
  */
-export async function detectLanguage(text: string): Promise<string> {
+export async function detectLanguage(text: string, llmConfig?: LlmConfigInput | null): Promise<string> {
   const sample = text.slice(0, 1000);
-  const providers = getAvailableProviders();
-  if (providers.length === 0) return 'unknown';
+  const attempts = resolveLlmConfig(llmConfig);
+  if (attempts.length === 0) return 'unknown';
 
   const systemPrompt = `Detect the language of the following text. Reply with ONLY the ISO 639-1 language code (e.g. "fr", "en", "es", "de", "pt", "it", "ar", "zh", "ja", "ko", "ru", "hi"). Nothing else.`;
 
-  for (const provider of providers) {
-    try {
-      const result = await detectWithProvider(provider, systemPrompt, sample);
-      const code = result.trim().toLowerCase().replace(/[^a-z]/g, '').slice(0, 2);
-      if (code && code.length === 2) {
-        console.log(`[Translator] Detected language: ${code} (via ${provider})`);
-        return code;
-      }
-    } catch (err: any) {
-      console.warn(`[Translator] Language detection failed with ${provider}: ${err.message}`);
-      continue;
+  try {
+    const result = await chatComplete({
+      label: 'DetectLang',
+      attempts,
+      temperature: 0,
+      maxTokens: 5,
+      messages: [
+        { role: 'system', content: systemPrompt },
+        { role: 'user', content: sample },
+      ],
+    });
+    const code = result.trim().toLowerCase().replace(/[^a-z]/g, '').slice(0, 2);
+    if (code && code.length === 2) {
+      console.log(`[Translator] Detected language: ${code}`);
+      return code;
     }
+  } catch (err: any) {
+    console.warn(`[Translator] Language detection failed: ${err?.message || err}`);
   }
   return 'unknown';
-}
-
-async function detectWithProvider(provider: Provider, systemPrompt: string, text: string): Promise<string> {
-  switch (provider) {
-    case 'groq': {
-      const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
-      const r = await groq.chat.completions.create({
-        model: 'llama-3.3-70b-versatile', messages: [{ role: 'system', content: systemPrompt }, { role: 'user', content: text }], temperature: 0, max_tokens: 5,
-      });
-      return r.choices[0].message.content || '';
-    }
-    case 'openrouter': {
-      const or = new OpenAI({ apiKey: process.env.OPENROUTER_API_KEY, baseURL: 'https://openrouter.ai/api/v1' });
-      const r = await or.chat.completions.create({
-        model: 'meta-llama/llama-3.3-70b-instruct', messages: [{ role: 'system', content: systemPrompt }, { role: 'user', content: text }], temperature: 0, max_tokens: 5,
-      });
-      return r.choices[0].message.content || '';
-    }
-    case 'openai': {
-      const oa = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
-      const r = await oa.chat.completions.create({
-        model: 'gpt-4o-mini', messages: [{ role: 'system', content: systemPrompt }, { role: 'user', content: text }], temperature: 0, max_tokens: 5,
-      });
-      return r.choices[0].message.content || '';
-    }
-  }
 }
 
 export async function translateText(
   text: string,
   targetLang: string,
   onProgress?: (progress: number) => void,
-  callbacks?: TranslateCallbacks
+  callbacks?: TranslateCallbacks,
+  llmConfig?: LlmConfigInput | null,
 ): Promise<string> {
   const langName = LANGUAGE_NAMES[targetLang] || targetLang;
   const chunks = splitTextIntoChunks(text, CHUNK_SIZE);
   const translatedChunks: string[] = [];
 
-  const availableProviders = getAvailableProviders();
-  if (availableProviders.length === 0) {
-    throw new Error('Aucune clé API configurée pour la traduction.');
+  const attempts = resolveLlmConfig(llmConfig);
+  if (attempts.length === 0) {
+    throw new Error('Aucun fournisseur LLM disponible pour la traduction (ajoutez une clé ou activez un tier gratuit).');
   }
 
-  // Track which providers are exhausted (rate limited)
-  const exhaustedProviders = new Set<Provider>();
-  let currentProviderIndex = 0;
-
-  function getCurrentProvider(): Provider | null {
-    while (currentProviderIndex < availableProviders.length) {
-      const p = availableProviders[currentProviderIndex];
-      if (!exhaustedProviders.has(p)) return p;
-      currentProviderIndex++;
-    }
-    return null;
-  }
-
-  let provider = getCurrentProvider();
-  if (!provider) throw new Error('Aucun fournisseur LLM disponible.');
-
-  console.log(`[Translator] Using ${provider} for translation (${chunks.length} chunks)`);
+  console.log(`[Translator] Chain: ${describeChain(attempts)} (${chunks.length} chunks)`);
 
   for (let i = 0; i < chunks.length; i++) {
     const chunk = chunks[i];
-    let translated: string | null = null;
-    let lastError: any = null;
+    let translated: string;
 
-    // Try current provider, fallback on rate limit
-    while (!translated) {
-      if (!provider) {
-        // All providers exhausted — return partial results
-        if (translatedChunks.length > 0) {
-          const partial = translatedChunks.join(' ');
-          console.log(`[Translator] All providers rate-limited at chunk ${i}/${chunks.length}. Returning partial: ${translatedChunks.length} chunks translated.`);
-          throw new PartialTranslationError(
-            partial,
-            i,
-            chunks.length,
-            `Tous les fournisseurs sont en limite de débit. ${translatedChunks.length}/${chunks.length} chunks traduits.`
-          );
-        }
-        throw lastError || new Error('Tous les fournisseurs LLM sont en limite de débit.');
+    try {
+      // Le routeur gère le failover entre fournisseurs/clés en interne.
+      translated = await chatComplete({
+        label: 'Translate',
+        attempts,
+        temperature: 0.3,
+        messages: [
+          { role: 'system', content: TRANSLATE_SYSTEM_PROMPT(langName) },
+          { role: 'user', content: chunk },
+        ],
+        onProviderSwitch: callbacks?.onProviderSwitch,
+      });
+    } catch (error: any) {
+      // Tous les fournisseurs ont échoué pour ce chunk → renvoyer le partiel si possible.
+      if (translatedChunks.length > 0) {
+        throw new PartialTranslationError(
+          translatedChunks.join(' '),
+          i,
+          chunks.length,
+          error?.message || 'Erreur de traduction',
+        );
       }
-
-      try {
-        translated = await translateChunk(provider, chunk, langName);
-      } catch (error: any) {
-        lastError = error;
-
-        if (isRateLimitError(error)) {
-          const oldProvider = provider;
-          exhaustedProviders.add(provider);
-          currentProviderIndex++;
-          provider = getCurrentProvider();
-
-          if (provider) {
-            console.log(`[Translator] Rate limit on ${oldProvider}, switching to ${provider} (chunk ${i + 1}/${chunks.length})`);
-            callbacks?.onProviderSwitch?.(oldProvider, provider);
-          }
-          // Loop will retry with new provider or exit if null
-        } else {
-          // Non-rate-limit error: throw immediately
-          if (translatedChunks.length > 0) {
-            throw new PartialTranslationError(
-              translatedChunks.join(' '),
-              i,
-              chunks.length,
-              error.message || 'Erreur de traduction'
-            );
-          }
-          throw error;
-        }
-      }
+      throw error;
     }
 
     translatedChunks.push(translated);
@@ -243,59 +162,3 @@ const TRANSLATE_SYSTEM_PROMPT = (targetLang: string) =>
   `You are a professional translator. Translate the following text to ${targetLang}.
 Keep the same meaning, tone, and style. Output ONLY the translation, nothing else.
 If the text contains technical terms (programming, AI, etc.), translate naturally but keep well-known English technical terms when appropriate.`;
-
-async function translateChunk(provider: Provider, text: string, targetLang: string): Promise<string> {
-  switch (provider) {
-    case 'groq': return translateWithGroq(text, targetLang);
-    case 'openrouter': return translateWithOpenRouter(text, targetLang);
-    case 'openai': return translateWithOpenAI(text, targetLang);
-  }
-}
-
-async function translateWithOpenAI(text: string, targetLang: string): Promise<string> {
-  const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
-
-  const response = await openai.chat.completions.create({
-    model: 'gpt-4o-mini',
-    messages: [
-      { role: 'system', content: TRANSLATE_SYSTEM_PROMPT(targetLang) },
-      { role: 'user', content: text }
-    ],
-    temperature: 0.3,
-  });
-
-  return response.choices[0].message.content || '';
-}
-
-async function translateWithOpenRouter(text: string, targetLang: string): Promise<string> {
-  const openrouter = new OpenAI({
-    apiKey: process.env.OPENROUTER_API_KEY,
-    baseURL: 'https://openrouter.ai/api/v1',
-  });
-
-  const response = await openrouter.chat.completions.create({
-    model: 'meta-llama/llama-3.3-70b-instruct',
-    messages: [
-      { role: 'system', content: TRANSLATE_SYSTEM_PROMPT(targetLang) },
-      { role: 'user', content: text }
-    ],
-    temperature: 0.3,
-  });
-
-  return response.choices[0].message.content || '';
-}
-
-async function translateWithGroq(text: string, targetLang: string): Promise<string> {
-  const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
-
-  const response = await groq.chat.completions.create({
-    model: 'llama-3.3-70b-versatile',
-    messages: [
-      { role: 'system', content: TRANSLATE_SYSTEM_PROMPT(targetLang) },
-      { role: 'user', content: text }
-    ],
-    temperature: 0.3,
-  });
-
-  return response.choices[0].message.content || '';
-}

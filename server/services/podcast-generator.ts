@@ -1,5 +1,4 @@
-import OpenAI from 'openai';
-import Groq from 'groq-sdk';
+import { chatComplete, resolveLlmConfig, type LlmConfigInput } from './llm/router.js';
 
 export type PodcastTone = 'formal' | 'casual' | 'humorous';
 export type PodcastSpeakerCount = 2 | 3 | 4;
@@ -54,27 +53,17 @@ IMPORTANT: Use ONLY these speaker labels: ${speakerFormat}.
 const SYSTEM_MSG = 'You are a professional podcast script writer. You write engaging, natural-sounding podcast scripts in French.';
 
 /**
- * Determine which LLM provider to use.
- * Priority: Groq > OpenRouter > OpenAI
- */
-function getProvider(): 'groq' | 'openrouter' | 'openai' {
-  if (process.env.GROQ_API_KEY) return 'groq';
-  if (process.env.OPENROUTER_API_KEY) return 'openrouter';
-  return 'openai';
-}
-
-/**
- * Generate a podcast-style script from text content using LLM.
+ * Generate a podcast-style script from text content using the LLM router
+ * (clés utilisateur > repli .env > tiers gratuits, avec failover automatique).
  */
 export async function generatePodcastScript(
   text: string,
-  options?: { tone?: PodcastTone; speakerCount?: PodcastSpeakerCount },
+  options?: { tone?: PodcastTone; speakerCount?: PodcastSpeakerCount; llmConfig?: LlmConfigInput | null },
 ): Promise<string> {
-  const provider = getProvider();
   const tone = options?.tone || 'casual';
   const speakerCount = options?.speakerCount || 2;
 
-  console.log(`[Podcast] Generating script with ${provider} (${text.length} chars input, tone=${tone}, speakers=${speakerCount})`);
+  console.log(`[Podcast] Generating script (${text.length} chars input, tone=${tone}, speakers=${speakerCount})`);
 
   // Truncate input if too long (LLM context limits)
   const maxInputChars = 15000;
@@ -84,68 +73,18 @@ export async function generatePodcastScript(
 
   const prompt = buildPodcastPrompt(speakerCount, tone) + inputText;
 
-  let script: string;
-
-  if (provider === 'groq') {
-    script = await generateWithGroq(prompt);
-  } else if (provider === 'openrouter') {
-    script = await generateWithOpenRouter(prompt);
-  } else {
-    script = await generateWithOpenAI(prompt);
-  }
+  const script = await chatComplete({
+    label: 'Podcast',
+    attempts: resolveLlmConfig(options?.llmConfig),
+    temperature: 0.7,
+    maxTokens: 8000,
+    messages: [
+      { role: 'system', content: SYSTEM_MSG },
+      { role: 'user', content: prompt },
+    ],
+  });
 
   console.log(`[Podcast] Script generated: ${script.length} chars`);
 
   return script;
-}
-
-async function generateWithGroq(prompt: string): Promise<string> {
-  const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
-
-  const response = await groq.chat.completions.create({
-    model: 'llama-3.3-70b-versatile',
-    messages: [
-      { role: 'system', content: SYSTEM_MSG },
-      { role: 'user', content: prompt },
-    ],
-    temperature: 0.7,
-    max_tokens: 8000,
-  });
-
-  return response.choices[0].message.content || '';
-}
-
-async function generateWithOpenRouter(prompt: string): Promise<string> {
-  const openrouter = new OpenAI({
-    apiKey: process.env.OPENROUTER_API_KEY,
-    baseURL: 'https://openrouter.ai/api/v1',
-  });
-
-  const response = await openrouter.chat.completions.create({
-    model: 'meta-llama/llama-3.3-70b-instruct',
-    messages: [
-      { role: 'system', content: SYSTEM_MSG },
-      { role: 'user', content: prompt },
-    ],
-    temperature: 0.7,
-    max_tokens: 8000,
-  });
-
-  return response.choices[0].message.content || '';
-}
-
-async function generateWithOpenAI(prompt: string): Promise<string> {
-  const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
-
-  const response = await openai.chat.completions.create({
-    model: 'gpt-4o-mini',
-    messages: [
-      { role: 'system', content: SYSTEM_MSG },
-      { role: 'user', content: prompt },
-    ],
-    temperature: 0.7,
-    max_tokens: 8000,
-  });
-
-  return response.choices[0].message.content || '';
 }

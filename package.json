@@ -5,6 +5,9 @@
   "type": "module",
   "scripts": {
     "dev": "concurrently -n client,server -c cyan,green \"vite\" \"tsx watch server/index.ts\"",
+    "predev": "prisma db push",
+    "start": "vite build && tsx server/index.ts",
+    "prestart": "prisma db push",
     "dev:client": "vite",
     "dev:server": "tsx watch server/index.ts",
     "build": "vite build",
@@ -14,6 +17,7 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "db:generate": "prisma generate",
+    "db:push": "prisma db push",
     "db:migrate": "prisma migrate dev",
     "db:studio": "prisma studio",
     "postinstall": "prisma generate",
@@ -21,8 +25,6 @@
     "setup:piper:win": "powershell -ExecutionPolicy Bypass -File scripts/setup-piper.ps1"
   },
   "dependencies": {
-    "@clerk/clerk-react": "^5.61.1",
-    "@clerk/express": "^1.7.74",
     "@elevenlabs/elevenlabs-js": "^2.36.0",
     "@hookform/resolvers": "^3.10.0",
     "@prisma/adapter-better-sqlite3": "^7.4.2",

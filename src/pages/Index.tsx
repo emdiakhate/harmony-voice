@@ -8,7 +8,6 @@ import {
   FileText,
   Mic,
   Video,
-  Sparkles,
   CheckCircle,
   Loader2,
   AlertCircle,
@@ -24,6 +23,7 @@ import {
   AlignLeft,
   Users,
   MessageSquare,
+  ChevronDown,
 } from "lucide-react";
 import FileDropZone from "@/components/FileDropZone";
 import LanguageSelector from "@/components/LanguageSelector";
@@ -34,8 +34,15 @@ import AudioPlayer from "@/components/AudioPlayer";
 import SaveDialog from "@/components/SaveDialog";
 import UserMenu from "@/components/UserMenu";
 import AudioCombiner from "@/components/AudioCombiner";
-import PdfSplitter from "@/components/PdfSplitter";
+import {
+  DropdownMenu,
+  DropdownMenuTrigger,
+  DropdownMenuContent,
+  DropdownMenuRadioGroup,
+  DropdownMenuRadioItem,
+} from "@/components/ui/dropdown-menu";
 import { toast } from "sonner";
+import { useSettings, buildLlmConfig, buildTaskConfig } from "@/hooks/useSettings";
 
 type InputMode = "file" | "url" | "text" | "combine";
 
@@ -94,6 +101,7 @@ async function readSSEStream(
 }
 
 const Index = () => {
+  const { settings } = useSettings();
   const [inputMode, setInputMode] = useState<InputMode>("url");
   const [selectedFiles, setSelectedFiles] = useState<File[]>([]);
   const [youtubeUrl, setYoutubeUrl] = useState("");
@@ -111,8 +119,9 @@ const Index = () => {
   const [errorMessage, setErrorMessage] = useState("");
   const abortRef = useRef<AbortController | null>(null);
 
-  // Podcast mode
-  const [podcastMode, setPodcastMode] = useState(false);
+  // Generation mode (audio vs podcast)
+  const [generationMode, setGenerationMode] = useState<"audio" | "podcast">("audio");
+  const podcastMode = generationMode === "podcast";
   const [podcastScript, setPodcastScript] = useState("");
   const [podcastTone, setPodcastTone] = useState<"formal" | "casual" | "humorous">("casual");
   const [podcastSpeakerCount, setPodcastSpeakerCount] = useState<2 | 3 | 4>(2);
@@ -132,11 +141,27 @@ const Index = () => {
 
   // Direct text input mode
   const [pastedText, setPastedText] = useState("");
-  const [textSkipTranslation, setTextSkipTranslation] = useState(false);
 
   // Transcript-only mode: user provides their own transcript (already in target language)
   const [userTranscript, setUserTranscript] = useState("");
   const [skipTranslation, setSkipTranslation] = useState(false);
+  const [processMode, setProcessMode] = useState<
+    "transcribe" | "translate" | "both" | null
+  >(null);
+
+  const isSameLang = sourceLang !== "auto" && sourceLang === targetLang;
+
+  const resolveEffectiveMode = useCallback(
+    (
+      source: "media" | "document" | "text" | "youtube"
+    ): "transcribe" | "translate" | "both" => {
+      if (processMode) return processMode;
+      if (isSameLang) return "transcribe";
+      if (source === "text" || source === "document") return "translate";
+      return "both";
+    },
+    [processMode, isSameLang]
+  );
 
   // Multi-file queue
   const [queueIndex, setQueueIndex] = useState(0);
@@ -162,9 +187,42 @@ const Index = () => {
     setWaitingForNext(false);
   }, []);
 
+  const splitPdfsInQueue = async (files: File[]): Promise<File[]> => {
+    const result: File[] = [];
+    for (const file of files) {
+      if (!file.name.toLowerCase().endsWith('.pdf')) {
+        result.push(file);
+        continue;
+      }
+      try {
+        const formData = new FormData();
+        formData.append('file', file);
+        formData.append('pagesPerChunk', '12');
+        const res = await fetch('/api/split-pdf', { method: 'POST', body: formData });
+        if (!res.ok) { result.push(file); continue; }
+        const data = await res.json();
+        if (data.chunks.length <= 1) { result.push(file); continue; }
+        const chunkFiles = await Promise.all(
+          data.chunks.map(async (chunk: { url: string; fileName: string }) => {
+            const blob = await fetch(chunk.url).then(r => r.blob());
+            return new File([blob], chunk.fileName, { type: 'application/pdf' });
+          })
+        );
+        toast.info(`PDF découpé en ${chunkFiles.length} parties`);
+        result.push(...chunkFiles);
+      } catch {
+        result.push(file);
+      }
+    }
+    return result;
+  };
+
   const processFile = useCallback(async (file: File, signal: AbortSignal) => {
     const isMedia = isMediaFile(file);
     const hasUserTranscript = userTranscript.trim().length > 0;
+    const effectiveMode = resolveEffectiveMode(isMedia ? "media" : "document");
+    const effectiveSkipTranslation =
+      effectiveMode === "transcribe" || skipTranslation || isSameLang;
     const baseSteps: ProcessingStep[] = [];
 
     if (!hasUserTranscript) {
@@ -175,7 +233,7 @@ const Index = () => {
       }
     }
 
-    if (!skipTranslation) {
+    if (!effectiveSkipTranslation) {
       baseSteps.push({ id: "translating", label: "Traduction", status: "pending" });
     }
 
@@ -200,9 +258,12 @@ const Index = () => {
     if (userTranscript.trim()) {
       formData.append("userTranscript", userTranscript.trim());
     }
-    if (skipTranslation) {
+    if (effectiveSkipTranslation) {
       formData.append("skipTranslation", "true");
     }
+    formData.append("llmConfig", JSON.stringify(buildLlmConfig(settings)));
+    formData.append("transcriptionConfig", JSON.stringify(buildTaskConfig(settings, "transcription")));
+    formData.append("ttsConfig", JSON.stringify(buildTaskConfig(settings, "tts")));
 
     const response = await fetch("/api/process-file", {
       method: "POST",
@@ -215,7 +276,17 @@ const Index = () => {
     }
 
     await readSSEStream(response, handleSSEEvent);
-  }, [targetLang, podcastMode, userTranscript, skipTranslation]);
+  }, [
+    targetLang,
+    podcastMode,
+    podcastTone,
+    podcastSpeakerCount,
+    userTranscript,
+    skipTranslation,
+    resolveEffectiveMode,
+    isSameLang,
+    settings,
+  ]);
 
   const handleProcess = async () => {
     if (inputMode === "url" && !youtubeUrl) {
@@ -241,8 +312,10 @@ const Index = () => {
 
     if (inputMode === "text") {
       // Direct text mode
+      const effectiveTextSkipTranslation =
+        resolveEffectiveMode("text") === "transcribe" || isSameLang;
       const baseSteps: ProcessingStep[] = [];
-      if (!textSkipTranslation) {
+      if (!effectiveTextSkipTranslation) {
         baseSteps.push({ id: "translating", label: "Traduction", status: "pending" });
       }
       if (podcastMode) {
@@ -263,9 +336,11 @@ const Index = () => {
             text: pastedText,
             targetLanguage: targetLang,
             podcastMode,
-            skipTranslation: textSkipTranslation,
+            skipTranslation: effectiveTextSkipTranslation,
             podcastTone,
             podcastSpeakerCount,
+            llmConfig: buildLlmConfig(settings),
+            ttsConfig: buildTaskConfig(settings, "tts"),
           }),
           signal: abortRef.current.signal,
         });
@@ -296,11 +371,16 @@ const Index = () => {
       }
     } else if (inputMode === "url") {
       // YouTube mode
+      const youtubeEffectiveMode = resolveEffectiveMode("youtube");
+      const youtubeSkipTranslation =
+        youtubeEffectiveMode === "transcribe" || isSameLang;
       const baseSteps: ProcessingStep[] = [
         { id: "download", label: "Extraction audio YouTube", status: "pending" },
         { id: "transcript", label: "Transcription Whisper IA", status: "pending" },
-        { id: "translating", label: "Traduction", status: "pending" },
       ];
+      if (!youtubeSkipTranslation) {
+        baseSteps.push({ id: "translating", label: "Traduction", status: "pending" });
+      }
       if (podcastMode) {
         baseSteps.push(
           { id: "podcast_script", label: "Generation script podcast", status: "pending" },
@@ -321,6 +401,10 @@ const Index = () => {
             podcastMode,
             podcastTone,
             podcastSpeakerCount,
+            skipTranslation: youtubeSkipTranslation,
+            llmConfig: buildLlmConfig(settings),
+            transcriptionConfig: buildTaskConfig(settings, "transcription"),
+            ttsConfig: buildTaskConfig(settings, "tts"),
           }),
           signal: abortRef.current.signal,
         });
@@ -350,13 +434,17 @@ const Index = () => {
         setIsTtsStreaming(false);
       }
     } else {
-      // File mode: process queue
-      await processFileQueue(0);
+      // File mode: auto-split large PDFs then process queue
+      const expandedFiles = await splitPdfsInQueue(selectedFiles);
+      if (expandedFiles.length !== selectedFiles.length) {
+        setSelectedFiles(expandedFiles);
+      }
+      await processFileQueue(0, expandedFiles);
     }
   };
 
-  const processFileQueue = async (startIndex: number) => {
-    for (let i = startIndex; i < selectedFiles.length; i++) {
+  const processFileQueue = async (startIndex: number, filesToProcess: File[] = selectedFiles) => {
+    for (let i = startIndex; i < filesToProcess.length; i++) {
       setQueueIndex(i);
       resetResultState();
       setIsProcessing(true);
@@ -366,7 +454,7 @@ const Index = () => {
       }
 
       try {
-        await processFile(selectedFiles[i], abortRef.current.signal);
+        await processFile(filesToProcess[i], abortRef.current.signal);
       } catch (error: any) {
         if (error.name === "AbortError") return;
         const msg = error.message?.includes("Failed to fetch")
@@ -387,7 +475,7 @@ const Index = () => {
       setIsTtsStreaming(false);
 
       // If there are more files, wait for user to proceed
-      if (i < selectedFiles.length - 1) {
+      if (i < filesToProcess.length - 1) {
         setWaitingForNext(true);
         // Wait for user to click "Next"
         await new Promise<void>((resolve) => {
@@ -681,6 +769,8 @@ const Index = () => {
           translatedText: translation,
           podcastTone,
           podcastSpeakerCount,
+          llmConfig: buildLlmConfig(settings),
+          ttsConfig: buildTaskConfig(settings, "tts"),
         }),
         signal: abortRef.current.signal,
       });
@@ -717,7 +807,7 @@ const Index = () => {
       const response = await fetch("/api/summarize", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ text: textToSummarize, language: targetLang }),
+        body: JSON.stringify({ text: textToSummarize, language: targetLang, llmConfig: buildLlmConfig(settings) }),
       });
 
       if (!response.ok) {
@@ -780,9 +870,6 @@ const Index = () => {
             </div>
           </div>
           <div className="flex items-center gap-4">
-            <span className="text-xs text-primary font-medium flex items-center gap-1">
-              <Sparkles className="w-3 h-3" /> Propulse par l'IA
-            </span>
             <UserMenu />
           </div>
         </div>
@@ -877,54 +964,6 @@ const Index = () => {
                 disabled={isProcessing || waitingForNext}
               />
 
-              {/* PDF auto-split */}
-              {!isProcessing && !waitingForNext && (
-                <PdfSplitter
-                  onChunksReady={(chunks) => {
-                    setSelectedFiles((prev) => [...prev, ...chunks]);
-                  }}
-                  disabled={isProcessing}
-                />
-              )}
-
-              {/* Transcript-only mode: show when a single file is selected */}
-              {selectedFiles.length === 1 && (
-                <div className="space-y-3 p-4 rounded-xl bg-muted/50 border border-border/50">
-                  <div className="flex items-center gap-2">
-                    <Type className="w-4 h-4 text-muted-foreground" />
-                    <span className="text-sm font-medium text-foreground">
-                      Transcription manuelle
-                    </span>
-                    <span className="text-xs text-muted-foreground">
-                      (optionnel - economise les tokens)
-                    </span>
-                  </div>
-                  <textarea
-                    value={userTranscript}
-                    onChange={(e) => setUserTranscript(e.target.value)}
-                    placeholder="Collez ici la transcription du fichier si vous l'avez deja..."
-                    rows={4}
-                    className="w-full px-4 py-3 rounded-lg bg-background border border-border text-sm text-foreground placeholder:text-muted-foreground focus:outline-none focus:ring-2 focus:ring-primary/50 resize-y"
-                  />
-                  {userTranscript.trim() && (
-                    <label className="flex items-center gap-2 cursor-pointer">
-                      <input
-                        type="checkbox"
-                        checked={skipTranslation}
-                        onChange={(e) => setSkipTranslation(e.target.checked)}
-                        className="w-4 h-4 rounded border-border text-primary focus:ring-primary/50"
-                      />
-                      <span className="text-sm text-foreground">
-                        La transcription est deja en{" "}
-                        <strong className="text-primary">
-                          {targetLang === "fr" ? "francais" : targetLang === "en" ? "anglais" : targetLang}
-                        </strong>{" "}
-                        — ne pas traduire, generer directement l'audio
-                      </span>
-                    </label>
-                  )}
-                </div>
-              )}
             </div>
           ) : inputMode === "text" ? (
             <div className="space-y-3">
@@ -941,21 +980,6 @@ const Index = () => {
                   <span className="text-xs text-muted-foreground">
                     {pastedText.trim().length} caracteres
                   </span>
-                  <label className="flex items-center gap-2 cursor-pointer">
-                    <input
-                      type="checkbox"
-                      checked={textSkipTranslation}
-                      onChange={(e) => setTextSkipTranslation(e.target.checked)}
-                      className="w-4 h-4 rounded border-border text-primary focus:ring-primary/50"
-                    />
-                    <span className="text-sm text-foreground">
-                      Deja en{" "}
-                      <strong className="text-primary">
-                        {targetLang === "fr" ? "francais" : targetLang === "en" ? "anglais" : targetLang}
-                      </strong>
-                      {" "}— generer directement l'audio
-                    </span>
-                  </label>
                 </div>
               )}
             </div>
@@ -993,29 +1017,45 @@ const Index = () => {
                 />
               </div>
 
-              {/* Podcast Mode Toggle */}
+              {/* Process Mode */}
+              {!isSameLang && (
+                <div className="space-y-2">
+                  <p className="text-xs text-muted-foreground font-medium">Operations</p>
+                  <div className="flex gap-2">
+                    {([
+                      { value: "transcribe" as const, label: "Transcrire" },
+                      { value: "translate" as const, label: "Traduire" },
+                      { value: "both" as const, label: "Les deux" },
+                    ]).map(({ value, label }) => (
+                      <button
+                        key={value}
+                        onClick={() =>
+                          setProcessMode((prev) => (prev === value ? null : value))
+                        }
+                        disabled={isProcessing}
+                        className={`px-4 py-2 rounded-lg text-sm font-medium transition-all ${
+                          processMode === value
+                            ? "bg-primary text-primary-foreground"
+                            : "bg-muted text-muted-foreground hover:text-foreground"
+                        } disabled:opacity-50`}
+                      >
+                        {label}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              {/* Podcast Options (visible when generationMode === "podcast") */}
               <div className="space-y-3">
-                <div className="flex items-center gap-3">
-                  <button
-                    onClick={() => setPodcastMode(!podcastMode)}
-                    disabled={isProcessing}
-                    className={`flex items-center gap-2 px-4 py-2.5 rounded-lg text-sm font-medium transition-all ${
-                      podcastMode
-                        ? "bg-primary text-primary-foreground"
-                        : "bg-muted text-muted-foreground hover:text-foreground"
-                    } disabled:opacity-50`}
-                  >
-                    <Radio className="w-4 h-4" />
-                    Mode Podcast
-                  </button>
-                  {podcastMode && (
+                {podcastMode && (
+                  <div className="flex items-center gap-3">
                     <span className="text-xs text-muted-foreground">
                       Podcast {podcastSpeakerCount} voix, ton {podcastTone === "formal" ? "formel" : podcastTone === "humorous" ? "humoristique" : "decontracte"}
                     </span>
-                  )}
-                </div>
+                  </div>
+                )}
 
-                {/* Podcast Options */}
                 {podcastMode && (
                   <div className="p-4 rounded-xl bg-muted/50 border border-border/50 space-y-4">
                     {/* Speaker Count */}
@@ -1083,27 +1123,50 @@ const Index = () => {
                   Annuler le traitement
                 </button>
               ) : !waitingForNext ? (
-                <button
-                  onClick={handleProcess}
-                  disabled={
-                    (inputMode === "file" && selectedFiles.length === 0) ||
-                    (inputMode === "text" && !pastedText.trim())
-                  }
-                  className="w-full py-4 rounded-xl bg-primary text-primary-foreground font-display font-semibold text-base hover:brightness-110 transition-all flex items-center justify-center gap-2 disabled:opacity-50"
-                >
-                  <Mic className="w-5 h-5" />
-                  {inputMode === "text"
-                    ? textSkipTranslation
-                      ? "Generer l'audio"
-                      : "Traduire & Generer l'audio"
-                    : skipTranslation
-                    ? "Generer l'audio"
-                    : inputMode === "file"
-                    ? selectedFiles.length > 1
-                      ? `Traduire ${selectedFiles.length} fichiers`
-                      : "Traduire & Generer l'audio"
-                    : "Transcrire & Traduire"}
-                </button>
+                <div className="flex w-full rounded-xl overflow-hidden">
+                  <button
+                    onClick={handleProcess}
+                    disabled={
+                      (inputMode === "file" && selectedFiles.length === 0) ||
+                      (inputMode === "text" && !pastedText.trim())
+                    }
+                    className="flex-1 py-4 bg-primary text-primary-foreground font-display font-semibold text-base hover:brightness-110 transition-all flex items-center justify-center gap-2 disabled:opacity-50"
+                  >
+                    {podcastMode ? <Radio className="w-5 h-5" /> : <Mic className="w-5 h-5" />}
+                    {podcastMode
+                      ? "Generer Podcast"
+                      : inputMode === "file" && selectedFiles.length > 1
+                      ? `Generer audio (${selectedFiles.length} fichiers)`
+                      : "Generer audio"}
+                  </button>
+                  <DropdownMenu>
+                    <DropdownMenuTrigger asChild>
+                      <button
+                        type="button"
+                        disabled={isProcessing}
+                        aria-label="Choisir le type de generation"
+                        className="px-3 bg-primary text-primary-foreground border-l border-primary-foreground/20 hover:brightness-110 transition-all disabled:opacity-50 flex items-center justify-center"
+                      >
+                        <ChevronDown className="w-5 h-5" />
+                      </button>
+                    </DropdownMenuTrigger>
+                    <DropdownMenuContent align="end">
+                      <DropdownMenuRadioGroup
+                        value={generationMode}
+                        onValueChange={(v) =>
+                          setGenerationMode(v as "audio" | "podcast")
+                        }
+                      >
+                        <DropdownMenuRadioItem value="audio">
+                          <Mic className="w-4 h-4 mr-2" /> Audio
+                        </DropdownMenuRadioItem>
+                        <DropdownMenuRadioItem value="podcast">
+                          <Radio className="w-4 h-4 mr-2" /> Podcast
+                        </DropdownMenuRadioItem>
+                      </DropdownMenuRadioGroup>
+                    </DropdownMenuContent>
+                  </DropdownMenu>
+                </div>
               ) : null}
             </>
           )}
