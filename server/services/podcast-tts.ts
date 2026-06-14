@@ -6,6 +6,7 @@ import path from 'path';
 import { execFile } from 'child_process';
 import { promisify } from 'util';
 import { isPiperAvailable, hasVoiceForLang, generateLongTextWithPiper } from './piper-tts.js';
+import { concatMp3Buffers } from './audio-concat.js';
 import { resolveTtsConfig, runWithFallback, type Attempt, type LlmConfigInput } from './llm/router.js';
 
 const execFileAsync = promisify(execFile);
@@ -85,7 +86,7 @@ async function generateSilenceBuffer(durationMs: number): Promise<Buffer> {
   try {
     await execFileAsync('ffmpeg', [
       '-f', 'lavfi',
-      '-i', `anullsrc=r=24000:cl=mono`,
+      '-i', `anullsrc=r=44100:cl=mono`,
       '-t', (durationMs / 1000).toString(),
       '-codec:a', 'libmp3lame',
       '-qscale:a', '9',
@@ -246,7 +247,7 @@ export async function generatePodcastAudio(
   finalParts.push(coreAudio);
   if (outroJingle.length > 0) finalParts.push(outroJingle);
 
-  const audioBuffer = Buffer.concat(finalParts);
+  const audioBuffer = await concatMp3Buffers(finalParts);
   return { audioBuffer, provider };
 }
 
@@ -359,7 +360,7 @@ async function generateWithGemini(
   }
 
   onProgress?.(100, 'Podcast audio généré avec Gemini');
-  return Buffer.concat(audioBuffers);
+  return concatMp3Buffers(audioBuffers);
 }
 
 /**
@@ -502,7 +503,7 @@ async function generateWithElevenLabs(
   }
 
   onProgress?.(100, 'Podcast audio généré avec ElevenLabs', 'elevenlabs');
-  return Buffer.concat(audioBuffers);
+  return concatMp3Buffers(audioBuffers);
 }
 
 /**
@@ -553,7 +554,7 @@ async function generateWithOpenAI(
   }
 
   onProgress?.(100, 'Podcast audio généré avec OpenAI');
-  return Buffer.concat(audioBuffers);
+  return concatMp3Buffers(audioBuffers);
 }
 
 /**
@@ -640,5 +641,5 @@ async function generatePodcastWithPiper(
   }
 
   onProgress?.(100, 'Podcast audio généré avec Piper', 'piper');
-  return Buffer.concat(audioBuffers);
+  return concatMp3Buffers(audioBuffers);
 }

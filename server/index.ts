@@ -10,6 +10,7 @@ import { downloadYouTubeAudio, downloadYouTubeVideo, mergeVideoAudio, extractVid
 import { transcribeAudio } from './services/transcriber.js';
 import { translateText, PartialTranslationError, detectLanguage } from './services/translator.js';
 import { splitForTTS, generateSpeechChunk, setEdgeTTSLang } from './services/tts.js';
+import { concatMp3Buffers } from './services/audio-concat.js';
 import { getPiperStatus } from './services/piper-tts.js';
 import { extractTextFromFile } from './services/document-parser.js';
 import { generatePodcastScript } from './services/podcast-generator.js';
@@ -134,7 +135,7 @@ async function streamingTTS(
   const audioUrl = `/api/audio/${finalFileName}`;
 
   if (audioBuffers.length > 0) {
-    fs.writeFileSync(finalPath, Buffer.concat(audioBuffers));
+    fs.writeFileSync(finalPath, await concatMp3Buffers(audioBuffers));
     console.log(`[TTS] ${ttsError ? 'Partial' : 'Final'} audio saved: ${finalFileName} (${audioBuffers.length}/${ttsChunks.length} chunks)`);
   }
 
@@ -296,7 +297,7 @@ async function pipelinedTranslateAndTTS(
   const audioUrl = `/api/audio/${finalFileName}`;
 
   if (audioBuffers.length > 0) {
-    fs.writeFileSync(finalPath, Buffer.concat(audioBuffers));
+    fs.writeFileSync(finalPath, await concatMp3Buffers(audioBuffers));
     console.log(`[Pipeline] TTS ${ttsError ? 'partial' : 'done'}: ${ttsChunkFileCount} audio chunks generated`);
   }
 

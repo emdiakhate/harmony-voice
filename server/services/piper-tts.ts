@@ -3,6 +3,7 @@ import os from 'os';
 import path from 'path';
 import { spawn, execFile } from 'child_process';
 import { promisify } from 'util';
+import { concatMp3Buffers } from './audio-concat.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -206,7 +207,7 @@ export async function generateLongTextWithPiper(
     audioBuffers.push(buffer);
   }
 
-  return Buffer.concat(audioBuffers);
+  return concatMp3Buffers(audioBuffers);
 }
 
 /**
