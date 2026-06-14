@@ -7,30 +7,27 @@ datasource db {
   provider = "sqlite"
 }
 
+// Application locale mono-utilisateur : une seule ligne User implicite, sans auth.
 model User {
   id        String   @id @default(cuid())
-  clerkId   String   @unique
-  email     String
-  plan      String   @default("free") // free, pro, business
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
-  usages    Usage[]
   savedVideos SavedVideo[]
   playlists   Playlist[]
+  providerKeys ProviderKey[]
 }
 
-model Usage {
-  id              String   @id @default(cuid())
-  userId          String
-  user            User     @relation(fields: [userId], references: [id])
-  type            String   // transcription, translation, tts, podcast
-  durationSeconds Int      @default(0)
-  creditsUsed     Int      @default(1) // 1 credit = 1 minute of audio
-  inputChars      Int      @default(0)
-  metadata        Json?
-  createdAt       DateTime @default(now())
+model ProviderKey {
+  id           String   @id @default(cuid())
+  userId       String
+  user         User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  provider     String
+  label        String
+  encryptedKey String   // AES-256-GCM : iv:authTag:ciphertext (base64)
+  disabled     Boolean  @default(false)
+  createdAt    DateTime @default(now())
 
-  @@index([userId, createdAt])
+  @@index([userId, provider])
 }
 
 model SavedVideo {

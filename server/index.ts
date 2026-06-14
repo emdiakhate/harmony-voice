@@ -13,9 +13,11 @@ import { splitForTTS, generateSpeechChunk, setEdgeTTSLang } from './services/tts
 import { getPiperStatus } from './services/piper-tts.js';
 import { extractTextFromFile } from './services/document-parser.js';
 import { generatePodcastScript } from './services/podcast-generator.js';
-import { generatePodcastAudio } from './services/podcast-tts.js';
-import { createAuthMiddleware, requireAuth, requireQuota, requirePodcastAccess } from './lib/auth.js';
-import { recordUsage, getMonthlyUsage, checkQuota, PLAN_LIMITS } from './lib/quota.js';
+import { generatePodcastAudio, AVAILABLE_VOICES } from './services/podcast-tts.js';
+import { chatComplete, resolveLlmConfig, resolveTranscribeConfig, hasAnyProvider, type LlmConfigInput } from './services/llm/router.js';
+import { loadUserKeys, injectKeys } from './services/llm/keystore.js';
+import { encrypt, decrypt, maskKey, isEncryptionConfigured } from './lib/crypto.js';
+import { requireAuth } from './lib/auth.js';
 import { prisma } from './lib/prisma.js';
 
 config();
@@ -25,9 +27,6 @@ const app = express();
 
 app.use(cors());
 app.use(express.json());
-
-// Clerk auth middleware (noop if CLERK_SECRET_KEY not set)
-app.use(createAuthMiddleware());
 
 // Multer for file uploads (200MB limit for video/audio)
 const upload = multer({
@@ -70,12 +69,26 @@ function sendSSE(res: express.Response, data: any) {
   res.write(`data: ${JSON.stringify(data)}\n\n`);
 }
 
+// Parse the LLM provider chain sent by the frontend (clés utilisateur + priorité).
+// Accepte un tableau JSON (body direct) ou une chaîne JSON (champ FormData).
+function parseLlmConfig(raw: any): LlmConfigInput | null {
+  if (!raw) return null;
+  try {
+    const v = typeof raw === 'string' ? JSON.parse(raw) : raw;
+    if (Array.isArray(v)) return v as LlmConfigInput;
+  } catch {
+    // ignore JSON invalide → repli sur la chaîne par défaut (.env + tiers gratuits)
+  }
+  return null;
+}
+
 // Shared: streaming TTS pipeline (used by both YouTube and file processing)
 async function streamingTTS(
   res: express.Response,
   translatedText: string,
   filePrefix: string,
   targetLanguage: string,
+  ttsConfig?: LlmConfigInput | null,
 ): Promise<string> {
   sendSSE(res, { step: 'tts', message: "Génération de l'audio traduit..." });
   setEdgeTTSLang(targetLanguage);
@@ -90,7 +103,7 @@ async function streamingTTS(
 
   for (let i = 0; i < ttsChunks.length; i++) {
     try {
-      const buffer = await generateSpeechChunk(ttsChunks[i]);
+      const buffer = await generateSpeechChunk(ttsChunks[i], ttsConfig);
       audioBuffers.push(buffer);
 
       const chunkFileName = `${filePrefix}_${targetLanguage}_${timestamp}_chunk${i}.mp3`;
@@ -147,6 +160,8 @@ async function pipelinedTranslateAndTTS(
   sourceText: string,
   filePrefix: string,
   targetLanguage: string,
+  llmConfig?: LlmConfigInput | null,
+  ttsConfig?: LlmConfigInput | null,
 ): Promise<{ translatedText: string; audioUrl: string }> {
   const timestamp = Date.now();
   const audioBuffers: Buffer[] = [];
@@ -174,7 +189,7 @@ async function pipelinedTranslateAndTTS(
         const ttsChunks = splitForTTS(chunkText);
         try {
           for (const ttsText of ttsChunks) {
-            const buffer = await generateSpeechChunk(ttsText);
+            const buffer = await generateSpeechChunk(ttsText, ttsConfig);
             audioBuffers.push(buffer);
 
             const chunkFileName = `${filePrefix}_${targetLanguage}_${timestamp}_chunk${ttsChunkFileCount}.mp3`;
@@ -243,7 +258,7 @@ async function pipelinedTranslateAndTTS(
         // Wake up TTS queue
         if (ttsResolve) ttsResolve();
       },
-    });
+    }, llmConfig);
     translationComplete = true;
     if (ttsResolve) ttsResolve();
   } catch (error: any) {
@@ -305,20 +320,25 @@ async function podcastPipeline(
   res: express.Response,
   translatedText: string,
   filePrefix: string,
+  podcastOptions?: { tone?: string; speakerCount?: number; voiceConfig?: Record<string, string>; llmConfig?: LlmConfigInput | null; ttsConfig?: LlmConfigInput | null },
 ): Promise<string> {
   // Step A: Generate podcast script
   sendSSE(res, { step: 'podcast_script', message: 'Génération du script podcast...' });
-  const podcastScript = await generatePodcastScript(translatedText);
+  const podcastScript = await generatePodcastScript(translatedText, {
+    tone: (podcastOptions?.tone as any) || 'casual',
+    speakerCount: (podcastOptions?.speakerCount as any) || 2,
+    llmConfig: podcastOptions?.llmConfig,
+  });
   console.log(`[Podcast] Script generated: ${podcastScript.length} chars`);
   sendSSE(res, { step: 'podcast_script_done', data: { script: podcastScript } });
 
-  // Step B: Generate podcast audio (Gemini > ElevenLabs > OpenAI)
-  sendSSE(res, { step: 'podcast_tts', message: 'Génération audio podcast...' });
+  // Step B: Generate podcast audio (Gemini > ElevenLabs > OpenAI) with jingles
+  sendSSE(res, { step: 'podcast_tts', message: 'Génération audio podcast (avec jingles)...' });
   let currentProvider = '';
   const { audioBuffer, provider } = await generatePodcastAudio(podcastScript, (progress, message, prov) => {
     if (prov) currentProvider = prov;
     sendSSE(res, { step: 'podcast_tts_progress', data: { progress, message, provider: currentProvider } });
-  });
+  }, podcastOptions?.voiceConfig, podcastOptions?.ttsConfig);
 
   console.log(`[Podcast] Audio generated with ${provider}: ${(audioBuffer.length / 1024 / 1024).toFixed(2)}MB`);
 
@@ -332,60 +352,15 @@ async function podcastPipeline(
   return `/api/audio/${podcastFileName}`;
 }
 
-// ===== User info & quota =====
-app.get('/api/user/me', requireAuth, async (req, res) => {
-  const user = (req as any).dbUser;
-  const quota = await checkQuota(user.id, user.plan);
-  const limits = PLAN_LIMITS[user.plan] || PLAN_LIMITS.free;
-
-  res.json({
-    id: user.id,
-    email: user.email,
-    plan: user.plan,
-    podcastEnabled: limits.podcastEnabled,
-    quota: {
-      used: quota.used,
-      limit: quota.limit,
-      remaining: quota.remaining,
-    },
-  });
-});
-
-app.get('/api/user/usage', requireAuth, async (req, res) => {
-  const user = (req as any).dbUser;
-  const now = new Date();
-  const startOfMonth = new Date(now.getFullYear(), now.getMonth(), 1);
-
-  const usages = await prisma.usage.findMany({
-    where: { userId: user.id, createdAt: { gte: startOfMonth } },
-    orderBy: { createdAt: 'desc' },
-    take: 50,
-  });
-
-  const summary = await prisma.usage.groupBy({
-    by: ['type'],
-    where: { userId: user.id, createdAt: { gte: startOfMonth } },
-    _sum: { creditsUsed: true },
-    _count: true,
-  });
-
-  res.json({ usages, summary });
-});
-
 // ===== YouTube processing (SSE stream) =====
-app.post('/api/process', requireAuth, requireQuota, async (req, res) => {
+app.post('/api/process', requireAuth, async (req, res) => {
   const user = (req as any).dbUser;
-  const { url, targetLanguage = 'fr', podcastMode = false } = req.body;
-
-  // Check podcast access
-  if (podcastMode) {
-    const limits = PLAN_LIMITS[user.plan] || PLAN_LIMITS.free;
-    if (!limits.podcastEnabled) {
-      return res.status(403).json({
-        error: 'Mode podcast réservé aux plans Pro et Business.',
-      });
-    }
-  }
+  const { url, targetLanguage = 'fr', podcastMode = false, podcastTone, podcastSpeakerCount, podcastVoiceConfig } = req.body;
+  const keyMap = await loadUserKeys(user.id);
+  const llmConfig = injectKeys(parseLlmConfig(req.body.llmConfig), keyMap);
+  const transcriptionConfig = injectKeys(parseLlmConfig(req.body.transcriptionConfig), keyMap);
+  const ttsConfig = injectKeys(parseLlmConfig(req.body.ttsConfig), keyMap);
+  const podcastOpts = podcastMode ? { tone: podcastTone, speakerCount: podcastSpeakerCount, voiceConfig: podcastVoiceConfig, llmConfig, ttsConfig } : undefined;
 
   res.setHeader('Content-Type', 'text/event-stream');
   res.setHeader('Cache-Control', 'no-cache');
@@ -402,8 +377,9 @@ app.post('/api/process', requireAuth, requireQuota, async (req, res) => {
       return res.end();
     }
 
-    if (!process.env.OPENAI_API_KEY && !process.env.GROQ_API_KEY && !process.env.OPENROUTER_API_KEY) {
-      sendSSE(res, { step: 'error', message: 'Aucune clé API configurée. Ajoutez GROQ_API_KEY, OPENROUTER_API_KEY ou OPENAI_API_KEY dans .env' });
+    // Transcription Whisper : clés utilisateur (Paramètres) + repli .env. Échec rapide si aucune.
+    if (resolveTranscribeConfig(transcriptionConfig).length === 0) {
+      sendSSE(res, { step: 'error', message: "La transcription Whisper nécessite une clé Groq ou OpenAI (dans les Paramètres ou .env). Les tiers gratuits ne transcrivent pas l'audio." });
       return res.end();
     }
 
@@ -415,7 +391,7 @@ app.post('/api/process', requireAuth, requireQuota, async (req, res) => {
 
     // Step 2: Transcribe
     sendSSE(res, { step: 'transcript', message: 'Transcription avec Whisper IA...' });
-    const { text: fullTranscript, segments } = await transcribeAudio(audioPath);
+    const { text: fullTranscript, segments } = await transcribeAudio(audioPath, transcriptionConfig);
     const speechStartOffset = segments.length > 0 ? segments[0].offset / 1000 : 0; // seconds
     console.log(`[Process] Transcript: ${segments.length} segments, ${fullTranscript.length} chars, speech starts at ${speechStartOffset.toFixed(2)}s`);
     sendSSE(res, { step: 'transcript_done', data: { transcript: fullTranscript, segmentCount: segments.length } });
@@ -429,7 +405,7 @@ app.post('/api/process', requireAuth, requireQuota, async (req, res) => {
 
     // Auto-detect language
     sendSSE(res, { step: 'detecting_language', message: 'Détection de la langue...' });
-    const detectedLang = await detectLanguage(fullTranscript);
+    const detectedLang = await detectLanguage(fullTranscript, llmConfig);
     sendSSE(res, { step: 'language_detected', data: { detectedLang } });
     const skipTranslation = detectedLang === targetLanguage;
     if (skipTranslation) {
@@ -442,9 +418,9 @@ app.post('/api/process', requireAuth, requireQuota, async (req, res) => {
       translatedText = fullTranscript;
       sendSSE(res, { step: 'translation_done', data: { translatedText, skipped: true } });
       if (podcastMode) {
-        audioUrl = await podcastPipeline(res, translatedText, videoId);
+        audioUrl = await podcastPipeline(res, translatedText, videoId, podcastOpts);
       } else {
-        audioUrl = await streamingTTS(res, translatedText, videoId, targetLanguage);
+        audioUrl = await streamingTTS(res, translatedText, videoId, targetLanguage, ttsConfig);
       }
     } else if (podcastMode) {
       // Podcast mode: translate first, then generate script + audio
@@ -458,7 +434,7 @@ app.post('/api/process', requireAuth, requireQuota, async (req, res) => {
             console.log(`[Process] Provider switch: ${from} → ${to}`);
             sendSSE(res, { step: 'translating_provider_switch', data: { from, to } });
           },
-        });
+        }, llmConfig);
       } catch (error: any) {
         if (error instanceof PartialTranslationError && error.partialText) {
           translatedText = error.partialText;
@@ -479,21 +455,13 @@ app.post('/api/process', requireAuth, requireQuota, async (req, res) => {
 
       console.log(`[Process] Translation done: ${translatedText.length} chars`);
       sendSSE(res, { step: 'translation_done', data: { translatedText } });
-      audioUrl = await podcastPipeline(res, translatedText, videoId);
+      audioUrl = await podcastPipeline(res, translatedText, videoId, podcastOpts);
     } else {
       // Standard mode: pipeline translate + TTS in parallel
-      const result = await pipelinedTranslateAndTTS(res, fullTranscript, videoId, targetLanguage);
+      const result = await pipelinedTranslateAndTTS(res, fullTranscript, videoId, targetLanguage, llmConfig, ttsConfig);
       translatedText = result.translatedText;
       audioUrl = result.audioUrl;
     }
-
-    // Record usage
-    const estimatedDuration = Math.ceil(translatedText.length / 15); // ~15 chars/second
-    await recordUsage(user.id, podcastMode ? 'podcast' : 'tts', {
-      durationSeconds: estimatedDuration,
-      inputChars: fullTranscript.length,
-      metadata: JSON.stringify({ videoId, targetLanguage, podcastMode }),
-    });
 
     sendSSE(res, {
       step: 'done',
@@ -510,7 +478,7 @@ app.post('/api/process', requireAuth, requireQuota, async (req, res) => {
 });
 
 // ===== File processing (PDF/DOCX/TXT/Video/Audio → translate → TTS) =====
-app.post('/api/process-file', requireAuth, requireQuota, upload.single('file'), async (req, res) => {
+app.post('/api/process-file', requireAuth, upload.single('file'), async (req, res) => {
   const user = (req as any).dbUser;
 
   res.setHeader('Content-Type', 'text/event-stream');
@@ -522,6 +490,17 @@ app.post('/api/process-file', requireAuth, requireQuota, upload.single('file'), 
   const file = req.file;
   const targetLanguage = req.body?.targetLanguage || 'fr';
   const podcastMode = req.body?.podcastMode === 'true';
+  const keyMap = await loadUserKeys(user.id);
+  const llmConfig = injectKeys(parseLlmConfig(req.body?.llmConfig), keyMap);
+  const transcriptionConfig = injectKeys(parseLlmConfig(req.body?.transcriptionConfig), keyMap);
+  const ttsConfig = injectKeys(parseLlmConfig(req.body?.ttsConfig), keyMap);
+  const podcastOpts = podcastMode ? {
+    tone: req.body?.podcastTone,
+    speakerCount: req.body?.podcastSpeakerCount ? parseInt(req.body.podcastSpeakerCount) : undefined,
+    voiceConfig: req.body?.podcastVoiceConfig ? JSON.parse(req.body.podcastVoiceConfig) : undefined,
+    llmConfig,
+    ttsConfig,
+  } : undefined;
   const userTranscript = req.body?.userTranscript?.trim() || '';
   let skipTranslation = req.body?.skipTranslation === 'true';
 
@@ -530,11 +509,13 @@ app.post('/api/process-file', requireAuth, requireQuota, upload.single('file'), 
     return res.end();
   }
 
-  if (!process.env.OPENAI_API_KEY && !process.env.GROQ_API_KEY && !process.env.OPENROUTER_API_KEY) {
-    sendSSE(res, { step: 'error', message: 'Aucune clé API configurée. Ajoutez GROQ_API_KEY, OPENROUTER_API_KEY ou OPENAI_API_KEY dans .env' });
+  if (!hasAnyProvider(llmConfig)) {
+    sendSSE(res, { step: 'error', message: 'Aucun fournisseur LLM disponible (ajoutez une clé dans les Paramètres ou activez un tier gratuit).' });
     cleanupAudioFile(file.path);
     return res.end();
   }
+  // Note : pour les fichiers média, la transcription Whisper requiert toujours GROQ_API_KEY/OPENAI_API_KEY
+  // (le transcripteur lèvera une erreur explicite si absente).
 
   const fileCategory = getFileCategory(file.originalname);
 
@@ -571,7 +552,7 @@ app.post('/api/process-file', requireAuth, requireQuota, upload.single('file'), 
       fs.renameSync(file.path, renamedPath);
 
       sendSSE(res, { step: 'transcript', message: 'Transcription audio/vidéo avec Whisper IA...' });
-      const { text: transcript, segments } = await transcribeAudio(renamedPath);
+      const { text: transcript, segments } = await transcribeAudio(renamedPath, transcriptionConfig);
       originalText = transcript;
       speechStartOffset = segments.length > 0 ? segments[0].offset / 1000 : 0; // seconds
       console.log(`[FileProcess] Transcribed media: ${segments.length} segments, ${originalText.length} chars from ${file.originalname}, speech starts at ${speechStartOffset.toFixed(2)}s`);
@@ -609,7 +590,7 @@ app.post('/api/process-file', requireAuth, requireQuota, upload.single('file'), 
     // Auto-detect language: skip translation if already in target language
     if (!skipTranslation) {
       sendSSE(res, { step: 'detecting_language', message: 'Détection de la langue...' });
-      const detectedLang = await detectLanguage(originalText);
+      const detectedLang = await detectLanguage(originalText, llmConfig);
       sendSSE(res, { step: 'language_detected', data: { detectedLang } });
       if (detectedLang === targetLanguage) {
         skipTranslation = true;
@@ -625,9 +606,9 @@ app.post('/api/process-file', requireAuth, requireQuota, upload.single('file'), 
       sendSSE(res, { step: 'translation_done', data: { translatedText, skipped: true } });
 
       if (podcastMode) {
-        audioUrl = await podcastPipeline(res, translatedText, filePrefix);
+        audioUrl = await podcastPipeline(res, translatedText, filePrefix, podcastOpts);
       } else {
-        audioUrl = await streamingTTS(res, translatedText, filePrefix, targetLanguage);
+        audioUrl = await streamingTTS(res, translatedText, filePrefix, targetLanguage, ttsConfig);
       }
     } else if (podcastMode) {
       // Podcast mode: translate first, then generate script + audio
@@ -641,7 +622,7 @@ app.post('/api/process-file', requireAuth, requireQuota, upload.single('file'), 
             console.log(`[FileProcess] Provider switch: ${from} → ${to}`);
             sendSSE(res, { step: 'translating_provider_switch', data: { from, to } });
           },
-        });
+        }, llmConfig);
       } catch (error: any) {
         if (error instanceof PartialTranslationError && error.partialText) {
           translatedText = error.partialText;
@@ -662,21 +643,13 @@ app.post('/api/process-file', requireAuth, requireQuota, upload.single('file'), 
 
       console.log(`[FileProcess] Translation done: ${translatedText.length} chars`);
       sendSSE(res, { step: 'translation_done', data: { translatedText } });
-      audioUrl = await podcastPipeline(res, translatedText, filePrefix);
+      audioUrl = await podcastPipeline(res, translatedText, filePrefix, podcastOpts);
     } else {
       // Standard mode: pipeline translate + TTS in parallel
-      const result = await pipelinedTranslateAndTTS(res, originalText, filePrefix, targetLanguage);
+      const result = await pipelinedTranslateAndTTS(res, originalText, filePrefix, targetLanguage, llmConfig, ttsConfig);
       translatedText = result.translatedText;
       audioUrl = result.audioUrl;
     }
-
-    // Record usage
-    const estimatedDuration = Math.ceil(translatedText.length / 15);
-    await recordUsage(user.id, podcastMode ? 'podcast' : 'tts', {
-      durationSeconds: estimatedDuration,
-      inputChars: originalText.length,
-      metadata: JSON.stringify({ fileName: file.originalname, fileCategory, targetLanguage, podcastMode, skipTranslation }),
-    });
 
     sendSSE(res, {
       step: 'done',
@@ -693,7 +666,7 @@ app.post('/api/process-file', requireAuth, requireQuota, upload.single('file'), 
 });
 
 // ===== Direct text processing (paste text → translate → TTS) =====
-app.post('/api/process-text', requireAuth, requireQuota, async (req, res) => {
+app.post('/api/process-text', requireAuth, async (req, res) => {
   const user = (req as any).dbUser;
 
   res.setHeader('Content-Type', 'text/event-stream');
@@ -702,15 +675,19 @@ app.post('/api/process-text', requireAuth, requireQuota, async (req, res) => {
   res.setHeader('X-Accel-Buffering', 'no');
   res.flushHeaders();
 
-  const { text, targetLanguage = 'fr', podcastMode = false, skipTranslation = false } = req.body || {};
+  const { text, targetLanguage = 'fr', podcastMode = false, skipTranslation = false, podcastTone, podcastSpeakerCount, podcastVoiceConfig } = req.body || {};
+  const keyMap = await loadUserKeys(user.id);
+  const llmConfig = injectKeys(parseLlmConfig(req.body?.llmConfig), keyMap);
+  const ttsConfig = injectKeys(parseLlmConfig(req.body?.ttsConfig), keyMap);
+  const podcastOpts = podcastMode ? { tone: podcastTone, speakerCount: podcastSpeakerCount, voiceConfig: podcastVoiceConfig, llmConfig, ttsConfig } : undefined;
 
   if (!text || !text.trim()) {
     sendSSE(res, { step: 'error', message: 'Aucun texte fourni.' });
     return res.end();
   }
 
-  if (!process.env.OPENAI_API_KEY && !process.env.GROQ_API_KEY && !process.env.OPENROUTER_API_KEY) {
-    sendSSE(res, { step: 'error', message: 'Aucune clé API configurée. Ajoutez GROQ_API_KEY, OPENROUTER_API_KEY ou OPENAI_API_KEY dans .env' });
+  if (!hasAnyProvider(llmConfig)) {
+    sendSSE(res, { step: 'error', message: 'Aucun fournisseur LLM disponible (ajoutez une clé dans les Paramètres ou activez un tier gratuit).' });
     return res.end();
   }
 
@@ -729,9 +706,9 @@ app.post('/api/process-text', requireAuth, requireQuota, async (req, res) => {
       sendSSE(res, { step: 'translation_done', data: { translatedText, skipped: true } });
 
       if (podcastMode) {
-        audioUrl = await podcastPipeline(res, translatedText, filePrefix);
+        audioUrl = await podcastPipeline(res, translatedText, filePrefix, podcastOpts);
       } else {
-        audioUrl = await streamingTTS(res, translatedText, filePrefix, targetLanguage);
+        audioUrl = await streamingTTS(res, translatedText, filePrefix, targetLanguage, ttsConfig);
       }
     } else if (podcastMode) {
       sendSSE(res, { step: 'translating', message: 'Traduction en cours...' });
@@ -744,7 +721,7 @@ app.post('/api/process-text', requireAuth, requireQuota, async (req, res) => {
             console.log(`[TextProcess] Provider switch: ${from} → ${to}`);
             sendSSE(res, { step: 'translating_provider_switch', data: { from, to } });
           },
-        });
+        }, llmConfig);
       } catch (error: any) {
         if (error instanceof PartialTranslationError && error.partialText) {
           translatedText = error.partialText;
@@ -763,21 +740,13 @@ app.post('/api/process-text', requireAuth, requireQuota, async (req, res) => {
       }
 
       sendSSE(res, { step: 'translation_done', data: { translatedText } });
-      audioUrl = await podcastPipeline(res, translatedText, filePrefix);
+      audioUrl = await podcastPipeline(res, translatedText, filePrefix, podcastOpts);
     } else {
       // Standard mode: pipeline translate + TTS
-      const result = await pipelinedTranslateAndTTS(res, originalText, filePrefix, targetLanguage);
+      const result = await pipelinedTranslateAndTTS(res, originalText, filePrefix, targetLanguage, llmConfig, ttsConfig);
       translatedText = result.translatedText;
       audioUrl = result.audioUrl;
     }
-
-    // Record usage
-    const estimatedDuration = Math.ceil(translatedText.length / 15);
-    await recordUsage(user.id, podcastMode ? 'podcast' : 'tts', {
-      durationSeconds: estimatedDuration,
-      inputChars: originalText.length,
-      metadata: JSON.stringify({ source: 'text', targetLanguage, podcastMode, skipTranslation }),
-    });
 
     sendSSE(res, {
       step: 'done',
@@ -792,17 +761,58 @@ app.post('/api/process-text', requireAuth, requireQuota, async (req, res) => {
   res.end();
 });
 
-// ===== Generate podcast from existing translated text =====
-app.post('/api/generate-podcast', requireAuth, requireQuota, async (req, res) => {
+// ===== Available podcast voices =====
+app.get('/api/podcast-voices', (_req, res) => {
+  res.json(AVAILABLE_VOICES);
+});
+
+// ===== Summarize text =====
+app.post('/api/summarize', requireAuth, async (req, res) => {
   const user = (req as any).dbUser;
-  const limits = PLAN_LIMITS[user.plan] || PLAN_LIMITS.free;
-  if (!limits.podcastEnabled) {
-    return res.status(403).json({
-      error: 'Mode podcast réservé aux plans Pro et Business.',
-    });
+  const { text, language = 'fr', llmConfig } = req.body;
+
+  if (!text || text.trim().length === 0) {
+    return res.status(400).json({ error: 'Texte requis.' });
   }
 
-  const { translatedText } = req.body;
+  try {
+    const maxChars = 15000;
+    const inputText = text.length > maxChars ? text.substring(0, maxChars) + '\n[...]' : text;
+
+    const prompt = `Résume le texte suivant de manière concise et structurée en ${language === 'fr' ? 'français' : language}.
+Fais un résumé clair avec les points clés. Le résumé doit faire environ 20% de la longueur du texte original.
+
+Texte à résumer:
+${inputText}`;
+
+    const keyMap = await loadUserKeys(user.id);
+    const summary = await chatComplete({
+      label: 'Summarize',
+      attempts: resolveLlmConfig(injectKeys(parseLlmConfig(llmConfig), keyMap)),
+      temperature: 0.3,
+      maxTokens: 4000,
+      messages: [{ role: 'user', content: prompt }],
+    });
+
+    res.json({ summary });
+  } catch (error: any) {
+    console.error('[Summarize] Error:', error.message);
+    res.status(500).json({ error: error.message || 'Erreur lors du résumé.' });
+  }
+});
+
+// ===== Generate podcast from existing translated text =====
+app.post('/api/generate-podcast', requireAuth, async (req, res) => {
+  const user = (req as any).dbUser;
+  const { translatedText, podcastTone, podcastSpeakerCount, podcastVoiceConfig } = req.body;
+  const keyMap = await loadUserKeys(user.id);
+  const podcastOpts = {
+    tone: podcastTone,
+    speakerCount: podcastSpeakerCount,
+    voiceConfig: podcastVoiceConfig,
+    llmConfig: injectKeys(parseLlmConfig(req.body.llmConfig), keyMap),
+    ttsConfig: injectKeys(parseLlmConfig(req.body.ttsConfig), keyMap),
+  };
 
   res.setHeader('Content-Type', 'text/event-stream');
   res.setHeader('Cache-Control', 'no-cache');
@@ -817,14 +827,7 @@ app.post('/api/generate-podcast', requireAuth, requireQuota, async (req, res) =>
 
   try {
     const filePrefix = `podcast_${Date.now()}`;
-    const audioUrl = await podcastPipeline(res, translatedText, filePrefix);
-
-    // Record usage
-    const estimatedDuration = Math.ceil(translatedText.length / 15);
-    await recordUsage(user.id, 'podcast', {
-      durationSeconds: estimatedDuration,
-      inputChars: translatedText.length,
-    });
+    const audioUrl = await podcastPipeline(res, translatedText, filePrefix, podcastOpts);
 
     sendSSE(res, {
       step: 'done',
@@ -1227,6 +1230,116 @@ app.delete('/api/playlists/:playlistId/videos/:videoId', requireAuth, async (req
   res.json(updated);
 });
 
+// Test provider API key
+async function testProviderKey(provider: string, key: string): Promise<boolean> {
+  const headers: Record<string, string> = {};
+  let url = "";
+  switch (provider) {
+    case "openai":
+      url = "https://api.openai.com/v1/models";
+      headers["Authorization"] = `Bearer ${key}`;
+      break;
+    case "groq":
+      url = "https://api.groq.com/openai/v1/models";
+      headers["Authorization"] = `Bearer ${key}`;
+      break;
+    case "openrouter":
+      url = "https://openrouter.ai/api/v1/models";
+      headers["Authorization"] = `Bearer ${key}`;
+      break;
+    case "gemini":
+      url = `https://generativelanguage.googleapis.com/v1beta/models?key=${key}`;
+      break;
+    case "elevenlabs":
+      url = "https://api.elevenlabs.io/v1/user";
+      headers["xi-api-key"] = key;
+      break;
+    case "claude":
+      url = "https://api.anthropic.com/v1/models";
+      headers["x-api-key"] = key;
+      headers["anthropic-version"] = "2023-06-01";
+      break;
+    default:
+      return false;
+  }
+  try {
+    const r = await fetch(url, { headers });
+    return r.ok;
+  } catch {
+    return false;
+  }
+}
+
+app.post('/api/settings/test-key', async (req, res) => {
+  const { provider, key } = req.body as { provider: string; key: string };
+  if (!provider || !key) {
+    res.json({ valid: false });
+    return;
+  }
+  const valid = await testProviderKey(provider, key);
+  res.json({ valid });
+});
+
+// ===== Clés API utilisateur (chiffrées en base) =====
+// Les clés sont stockées chiffrées (AES-256-GCM) et ne sont JAMAIS renvoyées en clair.
+
+app.get('/api/settings/keys', requireAuth, async (req, res) => {
+  const user = (req as any).dbUser;
+  const rows = await prisma.providerKey.findMany({
+    where: { userId: user.id },
+    orderBy: { createdAt: 'asc' },
+  });
+  const keys = rows.map((r) => {
+    let masked = '••••';
+    try { masked = maskKey(decrypt(r.encryptedKey)); } catch {}
+    return { id: r.id, provider: r.provider, label: r.label, masked, disabled: r.disabled, createdAt: r.createdAt };
+  });
+  res.json({ keys });
+});
+
+app.post('/api/settings/keys', requireAuth, async (req, res) => {
+  const user = (req as any).dbUser;
+  const { provider, key, label } = req.body as { provider?: string; key?: string; label?: string };
+  if (!provider || !key || !key.trim()) {
+    return res.status(400).json({ error: 'provider et key requis' });
+  }
+  if (!isEncryptionConfigured()) {
+    return res.status(500).json({ error: "ENCRYPTION_KEY non configurée côté serveur (openssl rand -hex 32)." });
+  }
+  const row = await prisma.providerKey.create({
+    data: {
+      userId: user.id,
+      provider,
+      label: label?.trim() || `${provider} #${Date.now() % 1000}`,
+      encryptedKey: encrypt(key.trim()),
+    },
+  });
+  res.json({ id: row.id, provider: row.provider, label: row.label, masked: maskKey(key.trim()), disabled: row.disabled, createdAt: row.createdAt });
+});
+
+app.patch('/api/settings/keys/:id', requireAuth, async (req, res) => {
+  const user = (req as any).dbUser;
+  const row = await prisma.providerKey.findFirst({ where: { id: req.params.id, userId: user.id } });
+  if (!row) return res.status(404).json({ error: 'Clé introuvable' });
+  const { disabled, label } = req.body as { disabled?: boolean; label?: string };
+  const updated = await prisma.providerKey.update({
+    where: { id: row.id },
+    data: {
+      ...(typeof disabled === 'boolean' ? { disabled } : {}),
+      ...(label !== undefined ? { label } : {}),
+    },
+  });
+  res.json({ id: updated.id, provider: updated.provider, label: updated.label, disabled: updated.disabled });
+});
+
+app.delete('/api/settings/keys/:id', requireAuth, async (req, res) => {
+  const user = (req as any).dbUser;
+  const row = await prisma.providerKey.findFirst({ where: { id: req.params.id, userId: user.id } });
+  if (!row) return res.status(404).json({ error: 'Clé introuvable' });
+  await prisma.providerKey.delete({ where: { id: row.id } });
+  res.json({ ok: true });
+});
+
 // Health check
 app.get('/api/health', (_req, res) => {
   res.json({
@@ -1237,14 +1350,24 @@ app.get('/api/health', (_req, res) => {
     openrouter: !!process.env.OPENROUTER_API_KEY,
     elevenlabs: !!process.env.ELEVENLABS_API_KEY,
     piper: getPiperStatus(),
-    auth: !!process.env.CLERK_SECRET_KEY,
   });
 });
+
+// En production (ou après `npm run build`), sert le frontend compilé depuis dist/.
+// Doit être enregistré APRÈS toutes les routes /api pour ne pas les masquer.
+const distDir = path.join(__dirname, '..', 'dist');
+if (fs.existsSync(distDir)) {
+  app.use(express.static(distDir));
+  // Fallback SPA : toute route non-/api renvoie index.html (routing côté client).
+  app.get(/^(?!\/api).*/, (_req, res) => {
+    res.sendFile(path.join(distDir, 'index.html'));
+  });
+  console.log('[Static] Frontend servi depuis dist/');
+}
 
 const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => {
   console.log(`Server running on http://localhost:${PORT}`);
-  console.log(`Auth: ${process.env.CLERK_SECRET_KEY ? 'Clerk enabled' : 'disabled (dev mode)'}`);
   console.log(`Database: SQLite (prisma)`);
   console.log(`OpenAI API key: ${process.env.OPENAI_API_KEY ? 'configured' : 'not set'}`);
   console.log(`Groq API key: ${process.env.GROQ_API_KEY ? 'configured (Whisper + translation)' : 'not set'}`);

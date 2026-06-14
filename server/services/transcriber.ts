@@ -5,6 +5,13 @@ import { promisify } from 'util';
 import path from 'path';
 import fs from 'fs';
 import os from 'os';
+import {
+  resolveTranscribeConfig,
+  runWithFallback,
+  describeChain,
+  type Attempt,
+  type LlmConfigInput,
+} from './llm/router.js';
 
 const execAsync = promisify(exec);
 
@@ -22,30 +29,81 @@ export interface TranscriptionResult {
 }
 
 /**
- * Transcribe an audio file using Whisper API (Groq or OpenAI).
- * Automatically splits files >25MB into chunks.
+ * Transcribe an audio file using Whisper (Groq ou OpenAI), en routant sur les clés
+ * de l'utilisateur (puis repli .env) avec failover automatique.
+ * Splits files >25MB into chunks.
  */
-export async function transcribeAudio(audioPath: string): Promise<TranscriptionResult> {
-  const useGroq = !!process.env.GROQ_API_KEY;
-
-  // OpenRouter ne supporte pas Whisper, on utilise Groq ou OpenAI
-  if (!useGroq && !process.env.OPENAI_API_KEY) {
-    throw new Error('GROQ_API_KEY ou OPENAI_API_KEY requis pour la transcription Whisper (OpenRouter ne supporte pas Whisper)');
+export async function transcribeAudio(
+  audioPath: string,
+  transcribeConfig?: LlmConfigInput | null,
+): Promise<TranscriptionResult> {
+  const attempts = resolveTranscribeConfig(transcribeConfig);
+  if (attempts.length === 0) {
+    throw new Error(
+      'La transcription Whisper nécessite une clé Groq ou OpenAI (aucune clé fournie dans les Paramètres ni dans .env). OpenRouter et les tiers gratuits ne transcrivent pas l\'audio.',
+    );
   }
 
-  console.log(`[Transcriber] Using ${useGroq ? 'Groq Whisper (whisper-large-v3-turbo)' : 'OpenAI Whisper (whisper-1)'}`);
+  console.log(`[Transcriber] Chain: ${describeChain(attempts)}`);
 
   const stats = fs.statSync(audioPath);
   const sizeMB = stats.size / 1024 / 1024;
 
   if (sizeMB <= MAX_FILE_SIZE_MB) {
-    // File is small enough, transcribe directly
-    return useGroq ? transcribeWithGroq(audioPath) : transcribeWithOpenAI(audioPath);
+    return transcribeOnce(audioPath, attempts);
   }
 
   // File is too large - split into chunks and transcribe each
   console.log(`[Transcriber] File too large (${sizeMB.toFixed(1)}MB). Splitting into chunks...`);
-  return transcribeInChunks(audioPath, sizeMB, useGroq);
+  return transcribeInChunks(audioPath, sizeMB, attempts);
+}
+
+/**
+ * Transcrit un fichier (≤25MB) en parcourant la chaîne de fournisseurs.
+ */
+function transcribeOnce(audioPath: string, attempts: Attempt[]): Promise<TranscriptionResult> {
+  return runWithFallback<TranscriptionResult>({
+    attempts,
+    label: 'Transcribe',
+    isEmpty: (r) => !r.text.trim() && r.segments.length === 0,
+    run: (a) => callTranscribe(a, audioPath),
+  });
+}
+
+/**
+ * Appel transcription pour un essai donné. Groq et OpenAI exposent la même API
+ * `audio.transcriptions.create` (verbose_json) ; on choisit le SDK selon le fournisseur.
+ */
+async function callTranscribe(attempt: Attempt, audioPath: string): Promise<TranscriptionResult> {
+  let response: any;
+
+  if (attempt.def.id === 'groq') {
+    const groq = new Groq({ apiKey: attempt.apiKey });
+    response = await groq.audio.transcriptions.create({
+      file: fs.createReadStream(audioPath),
+      model: attempt.model,
+      response_format: 'verbose_json',
+    });
+  } else {
+    const openai = new OpenAI({ apiKey: attempt.apiKey });
+    response = await openai.audio.transcriptions.create({
+      file: fs.createReadStream(audioPath),
+      model: attempt.model,
+      response_format: 'verbose_json',
+    });
+  }
+
+  const segments: TranscriptSegment[] = response.segments?.map((seg: any) => ({
+    text: (seg.text || '').trim(),
+    offset: (seg.start || 0) * 1000,
+    duration: ((seg.end || 0) - (seg.start || 0)) * 1000,
+  })) || [];
+
+  const text = response.text || segments.map((s) => s.text).join(' ');
+
+  console.log(`[Transcriber] ${attempt.def.label}: ${segments.length} segments, ${text.length} chars`);
+
+  return { text, segments };
 }
 
 /**
@@ -54,7 +112,7 @@ export async function transcribeAudio(audioPath: string): Promise<TranscriptionR
 async function transcribeInChunks(
   audioPath: string,
   sizeMB: number,
-  useGroq: boolean
+  attempts: Attempt[],
 ): Promise<TranscriptionResult> {
   // Calculate chunk duration: aim for ~20MB per chunk to stay safely under 25MB
   const audioDuration = await getAudioDuration(audioPath);
@@ -87,7 +145,7 @@ async function transcribeInChunks(
       }
     }
 
-    // Transcribe each chunk
+    // Transcribe each chunk (le routeur gère le failover par chunk)
     const allSegments: TranscriptSegment[] = [];
     const allTexts: string[] = [];
     let timeOffset = 0;
@@ -95,9 +153,7 @@ async function transcribeInChunks(
     for (let i = 0; i < chunkPaths.length; i++) {
       console.log(`[Transcriber] Transcribing chunk ${i + 1}/${chunkPaths.length}...`);
 
-      const result = useGroq
-        ? await transcribeWithGroq(chunkPaths[i])
-        : await transcribeWithOpenAI(chunkPaths[i]);
+      const result = await transcribeOnce(chunkPaths[i], attempts);
 
       allTexts.push(result.text);
 
@@ -142,50 +198,4 @@ async function getAudioDuration(audioPath: string): Promise<number> {
     const stats = fs.statSync(audioPath);
     return stats.size / 8000;
   }
-}
-
-async function transcribeWithGroq(audioPath: string): Promise<TranscriptionResult> {
-  const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
-
-  const response = await groq.audio.transcriptions.create({
-    file: fs.createReadStream(audioPath),
-    model: 'whisper-large-v3-turbo',
-    response_format: 'verbose_json',
-  });
-
-  const responseAny = response as any;
-  const segments: TranscriptSegment[] = responseAny.segments?.map((seg: any) => ({
-    text: (seg.text || '').trim(),
-    offset: (seg.start || 0) * 1000,
-    duration: ((seg.end || 0) - (seg.start || 0)) * 1000,
-  })) || [];
-
-  const text = responseAny.text || segments.map(s => s.text).join(' ');
-
-  console.log(`[Transcriber] Groq Whisper: ${segments.length} segments, ${text.length} chars`);
-
-  return { text, segments };
-}
-
-async function transcribeWithOpenAI(audioPath: string): Promise<TranscriptionResult> {
-  const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
-
-  const response = await openai.audio.transcriptions.create({
-    file: fs.createReadStream(audioPath),
-    model: 'whisper-1',
-    response_format: 'verbose_json',
-  });
-
-  const responseAny = response as any;
-  const segments: TranscriptSegment[] = responseAny.segments?.map((seg: any) => ({
-    text: (seg.text || '').trim(),
-    offset: (seg.start || 0) * 1000,
-    duration: ((seg.end || 0) - (seg.start || 0)) * 1000,
-  })) || [];
-
-  const text = responseAny.text || segments.map(s => s.text).join(' ');
-
-  console.log(`[Transcriber] OpenAI Whisper: ${segments.length} segments, ${text.length} chars`);
-
-  return { text, segments };
 }

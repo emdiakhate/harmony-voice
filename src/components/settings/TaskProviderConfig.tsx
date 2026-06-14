@@ -6,16 +6,17 @@ import {
   GripVertical,
   Plus,
   X,
-  ChevronDown,
-  Info,
+  ArrowDownUp,
 } from "lucide-react";
 import {
   type Provider,
   type Task,
   PROVIDERS,
   TASK_LABELS,
+  PROVIDER_MODELS,
   useSettings,
 } from "@/hooks/useSettings";
+import { useProviderKeys } from "@/hooks/useProviderKeys";
 
 const TASK_ICONS: Record<Task, typeof Mic> = {
   transcription: Mic,
@@ -23,33 +24,17 @@ const TASK_ICONS: Record<Task, typeof Mic> = {
   tts: Volume2,
 };
 
-// Which providers can do which task
 function getAvailableProviders(task: Task): Provider[] {
   return (Object.keys(PROVIDERS) as Provider[]).filter((p) =>
     PROVIDERS[p].capabilities.includes(task)
   );
 }
 
-// Model info per provider+task
-const MODEL_INFO: Record<string, string> = {
-  "openai:transcription": "Whisper large-v3",
-  "groq:transcription": "Whisper large-v3 (rapide)",
-  "openai:translation": "GPT-4o-mini",
-  "groq:translation": "LLaMA 3.3 70B",
-  "openrouter:translation": "Multi-modèle (auto)",
-  "gemini:translation": "Gemini 2.5 Flash",
-  "claude:translation": "Claude Sonnet 4",
-  "elevenlabs:tts": "Multilingual v2 (Sarah)",
-  "openai:tts": "TTS-1 (Nova)",
-  "gemini:tts": "Gemini 2.5 Flash TTS (Kore)",
-};
-
 export default function TaskProviderConfig() {
-  const { settings, setTaskProviders, hasKeyForProvider } = useSettings();
-  const [dragState, setDragState] = useState<{
-    task: Task;
-    fromIndex: number;
-  } | null>(null);
+  const { settings, setTaskProviders } = useSettings();
+  const { hasKeyForProvider } = useProviderKeys();
+  const [dragState, setDragState] = useState<{ task: Task; fromIndex: number } | null>(null);
+  const [dragOver, setDragOver] = useState<{ task: Task; index: number } | null>(null);
   const [addingTo, setAddingTo] = useState<Task | null>(null);
 
   const handleDragStart = (task: Task, index: number) => {
@@ -59,6 +44,7 @@ export default function TaskProviderConfig() {
   const handleDragOver = (e: React.DragEvent, task: Task, toIndex: number) => {
     e.preventDefault();
     if (!dragState || dragState.task !== task) return;
+    setDragOver({ task, index: toIndex });
   };
 
   const handleDrop = (task: Task, toIndex: number) => {
@@ -68,6 +54,12 @@ export default function TaskProviderConfig() {
     providers.splice(toIndex, 0, moved);
     setTaskProviders(task, providers);
     setDragState(null);
+    setDragOver(null);
+  };
+
+  const handleDragEnd = () => {
+    setDragState(null);
+    setDragOver(null);
   };
 
   const removeProvider = (task: Task, index: number) => {
@@ -89,12 +81,12 @@ export default function TaskProviderConfig() {
     <div className="space-y-4">
       <div>
         <h3 className="text-base font-semibold flex items-center gap-2">
-          <Info className="w-4 h-4" />
-          Assignation par tâche
+          <ArrowDownUp className="w-4 h-4" />
+          Priorité &amp; Fallback
         </h3>
         <p className="text-xs text-muted-foreground mt-0.5">
-          Définissez l'ordre de priorité des providers pour chaque tâche.
-          En cas de quota atteint, le provider suivant est utilisé automatiquement.
+          Glissez-déposez pour définir l'ordre de priorité des fournisseurs par tâche.
+          En cas de quota atteint, le fournisseur suivant est utilisé automatiquement.
         </p>
       </div>
 
@@ -127,14 +119,16 @@ export default function TaskProviderConfig() {
               <div className="p-2 space-y-1 min-h-[80px]">
                 {assigned.length === 0 && (
                   <div className="px-3 py-4 text-center text-xs text-muted-foreground">
-                    Aucun provider assigné
+                    Aucun fournisseur assigné
                   </div>
                 )}
                 {assigned.map((provider, index) => {
                   const p = PROVIDERS[provider];
                   const hasKey = hasKeyForProvider(provider);
+                  const isOver =
+                    dragOver?.task === task && dragOver?.index === index;
                   const modelInfo =
-                    MODEL_INFO[`${provider}:${task}`] || "";
+                    PROVIDER_MODELS[provider].find((m) => m.task === task)?.name ?? "";
 
                   return (
                     <div
@@ -143,8 +137,11 @@ export default function TaskProviderConfig() {
                       onDragStart={() => handleDragStart(task, index)}
                       onDragOver={(e) => handleDragOver(e, task, index)}
                       onDrop={() => handleDrop(task, index)}
+                      onDragEnd={handleDragEnd}
                       className={`flex items-center gap-2 px-3 py-2 rounded-lg border transition-all cursor-grab active:cursor-grabbing ${
-                        hasKey
+                        isOver
+                          ? "border-primary bg-primary/5"
+                          : hasKey
                           ? "border-border bg-background hover:bg-muted/50"
                           : "border-dashed border-yellow-500/40 bg-yellow-500/5"
                       }`}
@@ -162,7 +159,7 @@ export default function TaskProviderConfig() {
                           {p.name}
                           {!hasKey && (
                             <span className="text-[9px] text-yellow-600 bg-yellow-500/10 px-1 py-0.5 rounded">
-                              pas de clé
+                              sans clé
                             </span>
                           )}
                         </div>
@@ -189,11 +186,13 @@ export default function TaskProviderConfig() {
                   <div className="space-y-1">
                     {available.length === 0 ? (
                       <div className="px-3 py-2 text-xs text-muted-foreground text-center">
-                        Tous les providers compatibles sont déjà assignés
+                        Tous les fournisseurs compatibles sont déjà assignés
                       </div>
                     ) : (
                       available.map((provider) => {
                         const p = PROVIDERS[provider];
+                        const modelInfo =
+                          PROVIDER_MODELS[provider].find((m) => m.task === task)?.name ?? "";
                         return (
                           <button
                             key={provider}
@@ -201,13 +200,13 @@ export default function TaskProviderConfig() {
                             className="w-full flex items-center gap-2 px-3 py-2 rounded-lg text-xs hover:bg-muted transition-colors"
                           >
                             <div
-                              className="w-2 h-2 rounded-full"
+                              className="w-2 h-2 rounded-full shrink-0"
                               style={{ backgroundColor: p.color }}
                             />
                             {p.name}
-                            {MODEL_INFO[`${provider}:${task}`] && (
+                            {modelInfo && (
                               <span className="text-muted-foreground ml-auto text-[10px]">
-                                {MODEL_INFO[`${provider}:${task}`]}
+                                {modelInfo}
                               </span>
                             )}
                           </button>
@@ -227,7 +226,7 @@ export default function TaskProviderConfig() {
                     className="w-full flex items-center justify-center gap-1 px-3 py-1.5 text-[11px] text-muted-foreground hover:text-foreground rounded-lg border border-dashed border-border hover:border-primary/30 transition-colors"
                   >
                     <Plus className="w-3 h-3" />
-                    Ajouter un provider
+                    Ajouter un fournisseur
                   </button>
                 )}
               </div>

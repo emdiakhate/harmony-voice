@@ -1,73 +1,57 @@
-# Welcome to your Lovable project
+# VocaleezAI
 
-## Project info
+Outil **local et open-source** de transcription, traduction, synthèse vocale et génération de **podcasts multi-voix** à partir de vidéos YouTube, de fichiers (audio/vidéo/documents) ou de texte.
 
-**URL**: https://lovable.dev/projects/REPLACE_WITH_PROJECT_ID
+Vous apportez vos propres clés API (ou utilisez les fournisseurs gratuits). L'application route automatiquement les requêtes entre vos fournisseurs avec repli en cas d'erreur ou de quota atteint.
 
-## How can I edit this code?
+## Fonctionnalités
 
-There are several ways of editing your application.
+- 🎙️ **Transcription** (Whisper via Groq ou OpenAI)
+- 🌍 **Traduction** multilingue (Groq, OpenRouter, OpenAI, Gemini, + fournisseurs **gratuits** Pollinations / LLM7)
+- 🔊 **Synthèse vocale** (ElevenLabs, OpenAI, Gemini, + repli local **Piper** / Edge / Google)
+- 📻 **Podcast multi-voix** (2 à 4 intervenants, ton réglable, jingles)
+- 🔁 **Routage multi-clés** avec failover automatique et tiers gratuits
+- 🔒 Clés API **chiffrées au repos** (AES-256-GCM), jamais stockées en clair
 
-**Use Lovable**
+## Stack
 
-Simply visit the [Lovable Project](https://lovable.dev/projects/REPLACE_WITH_PROJECT_ID) and start prompting.
+Vite + React + TypeScript + Tailwind/shadcn-ui (frontend) · Express + Prisma + SQLite (backend) · `tsx`.
 
-Changes made via Lovable will be committed automatically to this repo.
+## Prérequis
 
-**Use your preferred IDE**
+- **Node.js 18+** et npm
+- *(optionnel)* [Piper](https://github.com/rhasspy/piper) pour le TTS local sans clé — voir `npm run setup:piper` (macOS/Linux) ou `npm run setup:piper:win` (Windows)
+- *(optionnel)* `ffmpeg` / `yt-dlp` pour certaines fonctions vidéo/YouTube
 
-If you want to work locally using your own IDE, you can clone this repo and push changes. Pushed changes will also be reflected in Lovable.
-
-The only requirement is having Node.js & npm installed - [install with nvm](https://github.com/nvm-sh/nvm#installing-and-updating)
-
-Follow these steps:
+## Installation
 
 ```sh
-# Step 1: Clone the repository using the project's Git URL.
-git clone <YOUR_GIT_URL>
-
-# Step 2: Navigate to the project directory.
-cd <YOUR_PROJECT_NAME>
-
-# Step 3: Install the necessary dependencies.
-npm i
-
-# Step 4: Start the development server with auto-reloading and an instant preview.
+git clone <URL_DU_DEPOT>
+cd vocaleez-ai
+npm install
 npm run dev
 ```
 
-**Edit a file directly in GitHub**
+`npm run dev` synchronise automatiquement la base (`prisma db push`) puis lance le frontend et l'API. Ouvrez l'URL indiquée par Vite (par défaut http://localhost:8080).
 
-- Navigate to the desired file(s).
-- Click the "Edit" button (pencil icon) at the top right of the file view.
-- Make your changes and commit the changes.
+**Lancement en un seul service** (build + serveur sur un seul port) :
 
-**Use GitHub Codespaces**
+```sh
+npm start
+# puis ouvrez http://localhost:3001
+```
 
-- Navigate to the main page of your repository.
-- Click on the "Code" button (green button) near the top right.
-- Select the "Codespaces" tab.
-- Click on "New codespace" to launch a new Codespace environment.
-- Edit files directly within the Codespace and commit and push your changes once you're done.
+> Aucune authentification : l'app est mono-utilisateur, prévue pour un usage local.
 
-## What technologies are used for this project?
+## Ajouter ses clés
 
-This project is built with:
+- **Depuis l'interface** : *Paramètres → choisir un fournisseur → coller la clé*. Elle est chiffrée et stockée localement (jamais renvoyée en clair).
+- **Depuis `.env`** : copiez `.env.example` en `.env` et renseignez les clés souhaitées (toutes optionnelles ; voir le fichier pour le détail).
 
-- Vite
-- TypeScript
-- React
-- shadcn-ui
-- Tailwind CSS
+Sans aucune clé, la **traduction** reste utilisable via les fournisseurs gratuits (Pollinations, LLM7) et le **TTS** via Piper local. La **transcription** nécessite une clé Groq ou OpenAI.
 
-## How can I deploy this project?
+## Notes
 
-Simply open [Lovable](https://lovable.dev/projects/REPLACE_WITH_PROJECT_ID) and click on Share -> Publish.
-
-## Can I connect a custom domain to my Lovable project?
-
-Yes, you can!
-
-To connect a domain, navigate to Project > Settings > Domains and click Connect Domain.
-
-Read more here: [Setting up a custom domain](https://docs.lovable.dev/features/custom-domain#custom-domain)
+- Données stockées en local dans `prisma/dev.db` (SQLite).
+- La clé de chiffrement des clés API est **générée automatiquement** au premier lancement (`.encryption-key`, ignoré par git). Sauvegardez-la si vous voulez pouvoir relire vos clés après une réinstallation — sinon il suffira de les re-saisir.
+- Le port se règle via `PORT` (défaut 3001) ; le proxy de dev s'aligne automatiquement.
