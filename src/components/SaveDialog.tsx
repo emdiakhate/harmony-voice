@@ -31,6 +31,7 @@ interface SaveDialogProps {
   transcription?: string;
   translation?: string;
   targetLanguage: string;
+  coverImageUrl?: string;
   onDownloadVideo?: () => void;
   isDownloadingVideo?: boolean;
 }
@@ -47,6 +48,7 @@ export default function SaveDialog({
   transcription,
   translation,
   targetLanguage,
+  coverImageUrl,
   onDownloadVideo,
   isDownloadingVideo,
 }: SaveDialogProps) {
@@ -75,7 +77,8 @@ export default function SaveDialog({
     setIsSaving(true);
 
     const thumbnailUrl =
-      videoId ? `https://img.youtube.com/vi/${videoId}/mqdefault.jpg` : null;
+      coverImageUrl ||
+      (videoId ? `https://img.youtube.com/vi/${videoId}/mqdefault.jpg` : null);
     const estimatedDuration = translation ? Math.ceil(translation.length / 15) : 0;
 
     try {
@@ -112,7 +115,8 @@ export default function SaveDialog({
     if (!vid) {
       setIsSaving(true);
       const thumbnailUrl =
-        videoId ? `https://img.youtube.com/vi/${videoId}/mqdefault.jpg` : null;
+        coverImageUrl ||
+        (videoId ? `https://img.youtube.com/vi/${videoId}/mqdefault.jpg` : null);
       const estimatedDuration = translation ? Math.ceil(translation.length / 15) : 0;
 
       try {
@@ -128,8 +132,7 @@ export default function SaveDialog({
             audioUrl: audioUrl || null,
             targetLanguage,
             durationSeconds: estimatedDuration,
-            thumbnailUrl:
-              videoId ? `https://img.youtube.com/vi/${videoId}/mqdefault.jpg` : null,
+            thumbnailUrl,
           }),
         });
         if (res.ok) {
@@ -218,6 +221,17 @@ export default function SaveDialog({
           </div>
 
           <div className="p-6 space-y-4">
+            {/* Cover preview */}
+            {coverImageUrl && (
+              <div className="flex justify-center">
+                <img
+                  src={coverImageUrl}
+                  alt="Couverture"
+                  className="w-28 h-28 rounded-xl object-cover border border-border shadow-md"
+                />
+              </div>
+            )}
+
             {/* Download buttons */}
             <div className="space-y-2">
               <p className="text-xs font-medium text-muted-foreground uppercase tracking-wider">

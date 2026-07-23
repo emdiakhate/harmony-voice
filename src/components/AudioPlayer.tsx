@@ -17,6 +17,7 @@ interface AudioPlayerProps {
   audioUrl?: string;
   isStreaming?: boolean;
   title?: string;
+  coverImageUrl?: string;
 }
 
 const SPEED_OPTIONS = [0.5, 0.75, 1, 1.25, 1.5, 1.75, 2];
@@ -27,6 +28,7 @@ const AudioPlayer = ({
   audioUrl,
   isStreaming = false,
   title = "Audio traduit",
+  coverImageUrl,
 }: AudioPlayerProps) => {
   const audioRef = useRef<HTMLAudioElement>(null);
   const [isPlaying, setIsPlaying] = useState(false);
@@ -207,6 +209,17 @@ const AudioPlayer = ({
         onLoadedMetadata={handleLoadedMetadata}
         onEnded={handleEnded}
       />
+
+      {/* Couverture générée (style livre audio) */}
+      {coverImageUrl && (
+        <div className="flex justify-center pb-1">
+          <img
+            src={coverImageUrl}
+            alt={title}
+            className="w-44 h-44 rounded-xl object-cover shadow-lg border border-border"
+          />
+        </div>
+      )}
 
       <div className="flex items-center justify-between mb-1">
         <p className="text-sm font-medium text-foreground flex items-center gap-2">

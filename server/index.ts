@@ -15,8 +15,9 @@ import { getPiperStatus } from './services/piper-tts.js';
 import { extractTextFromFile } from './services/document-parser.js';
 import { generatePodcastScript } from './services/podcast-generator.js';
 import { generatePodcastAudio, AVAILABLE_VOICES } from './services/podcast-tts.js';
-import { chatComplete, resolveLlmConfig, resolveTranscribeConfig, hasAnyProvider, type LlmConfigInput } from './services/llm/router.js';
+import { chatComplete, resolveLlmConfig, resolveTranscribeConfig, resolveImageConfig, hasAnyProvider, type LlmConfigInput } from './services/llm/router.js';
 import { loadUserKeys, injectKeys } from './services/llm/keystore.js';
+import { buildCoverPrompt, generateCoverImage, embedCoverArt, type CoverStyle } from './services/image-generator.js';
 import { encrypt, decrypt, maskKey, isEncryptionConfigured } from './lib/crypto.js';
 import { requireAuth } from './lib/auth.js';
 import { prisma } from './lib/prisma.js';
@@ -802,6 +803,59 @@ ${inputText}`;
   }
 });
 
+// ===== Generate cover image (audiobook-style thumbnail) =====
+app.post('/api/generate-cover', requireAuth, upload.single('referenceImage'), async (req, res) => {
+  const user = (req as any).dbUser;
+  const refFile = req.file; // multer = disque ; req.file.path est un chemin temporaire
+  try {
+    const { title, author, subtitle, style, contentHint, audioUrl } = req.body || {};
+
+    const keyMap = await loadUserKeys(user.id);
+    const imageConfig = injectKeys(parseLlmConfig(req.body?.imageConfig), keyMap);
+    const attempts = resolveImageConfig(imageConfig);
+
+    // Image de référence optionnelle → data URL base64 (seul OpenRouter l'exploite).
+    let referenceImageDataUrl: string | undefined;
+    if (refFile) {
+      const buf = fs.readFileSync(refFile.path);
+      const mime = refFile.mimetype || 'image/png';
+      referenceImageDataUrl = `data:${mime};base64,${buf.toString('base64')}`;
+    }
+
+    const prompt = buildCoverPrompt({
+      title,
+      author,
+      subtitle,
+      style: (style as CoverStyle) || 'audiobook',
+      contentHint,
+    });
+
+    const buffer = await generateCoverImage({ prompt, referenceImageDataUrl, attempts });
+
+    const coverFileName = `cover_${Date.now()}.png`;
+    fs.writeFileSync(path.join(outputDir, coverFileName), buffer);
+    const coverImageUrl = `/api/audio/${coverFileName}`;
+
+    // Intégration ID3 best-effort dans le MP3 source (si fourni et présent sur disque).
+    if (audioUrl && typeof audioUrl === 'string') {
+      const audioName = path.basename(audioUrl); // sécurité: jamais hors de outputDir
+      const audioPath = path.join(outputDir, audioName);
+      if (audioName.toLowerCase().endsWith('.mp3') && fs.existsSync(audioPath)) {
+        await embedCoverArt(audioPath, path.join(outputDir, coverFileName));
+      }
+    }
+
+    res.json({ coverImageUrl });
+  } catch (error: any) {
+    console.error('[Cover] Error:', error?.message || error);
+    res.status(500).json({ error: error?.message || 'Erreur lors de la génération de la couverture.' });
+  } finally {
+    if (refFile) {
+      try { fs.unlinkSync(refFile.path); } catch {}
+    }
+  }
+});
+
 // ===== Generate podcast from existing translated text =====
 app.post('/api/generate-podcast', requireAuth, async (req, res) => {
   const user = (req as any).dbUser;
@@ -1113,6 +1167,49 @@ app.post('/api/combine-audio', requireAuth, upload.array('files', 50), async (re
       try { fs.unlinkSync(f.path); } catch {}
     }
     res.status(500).json({ error: error.message || 'Erreur lors de la combinaison audio.' });
+  }
+});
+
+// ===== Combine already-generated audio chunks (already on server disk) into one =====
+// Reuses concatMp3Buffers (ffmpeg decode → resample → re-encode) so the recomposed file
+// has a correct header/duration and no speed glitches. No re-upload: the parts are read
+// straight from outputDir by basename (path traversal is impossible).
+app.post('/api/combine-chunks', requireAuth, async (req, res) => {
+  const { audioUrls, fileName } = req.body as { audioUrls?: string[]; fileName?: string };
+
+  if (!Array.isArray(audioUrls) || audioUrls.length < 2) {
+    return res.status(400).json({ error: 'Au moins 2 audios requis.' });
+  }
+
+  try {
+    const buffers: Buffer[] = [];
+    for (const url of audioUrls) {
+      const name = path.basename(String(url)); // sécurité: jamais hors de outputDir
+      const filePath = path.join(outputDir, name);
+      if (!fs.existsSync(filePath)) {
+        return res.status(404).json({ error: `Audio introuvable: ${name}` });
+      }
+      buffers.push(fs.readFileSync(filePath));
+    }
+
+    const combined = await concatMp3Buffers(buffers);
+
+    const safeBase = (fileName || 'document').replace(/[^a-z0-9_-]+/gi, '_').slice(0, 40) || 'document';
+    const outName = `combined_${safeBase}_${Date.now()}.mp3`;
+    const outPath = path.join(outputDir, outName);
+    fs.writeFileSync(outPath, combined);
+
+    const stats = fs.statSync(outPath);
+    console.log(`[CombineChunks] ${audioUrls.length} parties → ${outName} (${(stats.size / 1024 / 1024).toFixed(1)}MB)`);
+
+    res.json({
+      audioUrl: `/api/audio/${outName}`,
+      fileSize: `${(stats.size / 1024 / 1024).toFixed(1)}MB`,
+      partCount: audioUrls.length,
+    });
+  } catch (error: any) {
+    console.error('[CombineChunks] Error:', error.message);
+    res.status(500).json({ error: error.message || 'Erreur lors de la combinaison des audios.' });
   }
 });
 

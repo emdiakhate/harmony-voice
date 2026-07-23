@@ -244,6 +244,21 @@ export function buildLlmConfig(settings: SettingsState): LlmConfigEntry[] {
   return buildTaskConfig(settings, "translation");
 }
 
+/**
+ * Chaîne pour la génération d'image (couverture) : OpenRouter « nano banana » en
+ * principal, repli gratuit Pollinations. Le modèle et les clés sont fixés/injectés
+ * côté serveur ; on n'envoie que l'ordre + un éventuel override de baseUrl OpenRouter.
+ */
+export function buildImageConfig(settings: SettingsState): LlmConfigEntry[] {
+  const chain: Provider[] = ["openrouter", "pollinations"];
+  return chain.map((provider) => {
+    const entry: LlmConfigEntry = { provider, keys: [] };
+    const baseUrl = settings.providerBaseUrls[provider];
+    if (baseUrl) entry.baseUrl = baseUrl;
+    return entry;
+  });
+}
+
 // --- Hook ---
 
 export function useSettings() {

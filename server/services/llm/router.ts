@@ -17,6 +17,8 @@ import {
   DEFAULT_TRANSCRIBE_CHAIN,
   TTS_PROVIDERS,
   DEFAULT_TTS_CHAIN,
+  IMAGE_PROVIDERS,
+  DEFAULT_IMAGE_CHAIN,
   type LlmProviderDef,
 } from './providers.js';
 import { isAvailable, recordSuccess, recordFailure, keyIdFor } from './ledger.js';
@@ -121,6 +123,10 @@ export function resolveTranscribeConfig(input?: LlmConfigInput | null): Attempt[
 
 export function resolveTtsConfig(input?: LlmConfigInput | null): Attempt[] {
   return resolveChain(input, TTS_PROVIDERS, DEFAULT_TTS_CHAIN);
+}
+
+export function resolveImageConfig(input?: LlmConfigInput | null): Attempt[] {
+  return resolveChain(input, IMAGE_PROVIDERS, DEFAULT_IMAGE_CHAIN);
 }
 
 /** Au moins un fournisseur LLM (chat) disponible ? Sert aux gardes des endpoints. */

@@ -176,3 +176,30 @@ export const TTS_PROVIDERS: Record<string, LlmProviderDef> = {
 };
 
 export const DEFAULT_TTS_CHAIN: string[] = ['elevenlabs', 'openai', 'gemini'];
+
+// ===== Phase 3 : Génération d'image (couverture / miniature) =====
+// OpenRouter expose les modèles « image » via /chat/completions (modalities image+text) —
+// pas l'API images.generate ; la logique d'appel vit dans image-generator.ts.
+// Pollinations fait office de repli 100% gratuit et sans clé (GET image.pollinations.ai).
+
+export const IMAGE_PROVIDERS: Record<string, LlmProviderDef> = {
+  openrouter: {
+    id: 'openrouter',
+    label: 'OpenRouter (Nano Banana)',
+    baseURL: 'https://openrouter.ai/api/v1',
+    // « nano banana » = Gemini 2.5 Flash Image (génération + édition avec image de référence).
+    defaultModel: 'google/gemini-2.5-flash-image',
+    envKey: 'OPENROUTER_API_KEY',
+    requiresKey: true,
+  },
+  pollinations: {
+    id: 'pollinations',
+    label: 'Pollinations Image (gratuit)',
+    baseURL: 'https://image.pollinations.ai',
+    defaultModel: 'flux',
+    requiresKey: false,
+    noKeyPlaceholder: 'unused',
+  },
+};
+
+export const DEFAULT_IMAGE_CHAIN: string[] = ['openrouter', 'pollinations'];
