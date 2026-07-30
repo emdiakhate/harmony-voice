@@ -12,7 +12,7 @@ export default function UserMenu() {
         className="flex items-center gap-1.5 text-xs text-muted-foreground hover:text-foreground transition-colors"
       >
         <Settings className="w-3.5 h-3.5" />
-        Parametres
+        Paramètres
       </button>
       <button
         onClick={() => navigate("/playlists")}

@@ -40,6 +40,10 @@ export interface SessionSnapshot {
 
 const KEY = "vocaleez:lastSession";
 
+// Durée de vie d'une session sauvegardée : au-delà, on la considère périmée et
+// on la purge (évite qu'une vieille session traîne indéfiniment en localStorage).
+const SESSION_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+
 export function saveSession(snapshot: SessionSnapshot): void {
   try {
     localStorage.setItem(KEY, JSON.stringify(snapshot));
@@ -52,7 +56,13 @@ export function loadSession(): SessionSnapshot | null {
   try {
     const raw = localStorage.getItem(KEY);
     if (!raw) return null;
-    return JSON.parse(raw) as SessionSnapshot;
+    const snap = JSON.parse(raw) as SessionSnapshot;
+    // Purge des sessions périmées (au-delà du TTL).
+    if (snap.savedAt && Date.now() - snap.savedAt > SESSION_TTL_MS) {
+      clearSession();
+      return null;
+    }
+    return snap;
   } catch {
     return null;
   }

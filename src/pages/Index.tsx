@@ -125,7 +125,7 @@ function describeStreamError(error: unknown): string | null {
   const e = error as { name?: string; message?: string; cause?: unknown };
   if (e?.name === "AbortError") return null;
   if (e?.cause === "connection-lost")
-    return "Connexion interrompue (veille ?). Vos textes sont conserves — cliquez sur « Reprendre ».";
+    return "Connexion interrompue (veille ?). Vos textes sont conservés — cliquez sur « Reprendre ».";
   if (e?.message?.includes("Failed to fetch"))
     return "Impossible de contacter le serveur. Lancez le backend avec: npm run dev:server";
   return e?.message || "Erreur de connexion au serveur";
@@ -273,7 +273,7 @@ const Index = () => {
     setLocalVideoUrl(snap.localVideoUrl);
     // Generation was still running when the page was lost → offer to resume.
     if (snap.status === "processing") setInterrupted(true);
-    toast.info("Session precedente restauree");
+    toast.info("Session précédente restaurée");
   }, []);
 
   // Persist the working session whenever results change.
@@ -371,11 +371,11 @@ const Index = () => {
 
     if (podcastMode) {
       baseSteps.push(
-        { id: "podcast_script", label: "Generation script podcast", status: "pending" },
-        { id: "podcast_tts", label: "Generation audio podcast", status: "pending" },
+        { id: "podcast_script", label: "Génération du script podcast", status: "pending" },
+        { id: "podcast_tts", label: "Génération de l’audio podcast", status: "pending" },
       );
     } else {
-      baseSteps.push({ id: "tts", label: "Generation de l'audio", status: "pending" });
+      baseSteps.push({ id: "tts", label: "Génération de l’audio", status: "pending" });
     }
     setSteps(baseSteps);
 
@@ -404,7 +404,7 @@ const Index = () => {
     });
 
     if (!response.ok) {
-      throw new Error("Erreur serveur. Verifiez que le backend est lance.");
+      throw new Error("Erreur serveur. Vérifiez que le backend est lancé.");
     }
 
     await readSSEStream(response, handleSSEEvent);
@@ -455,11 +455,11 @@ const Index = () => {
       }
       if (podcastMode) {
         baseSteps.push(
-          { id: "podcast_script", label: "Generation script podcast", status: "pending" },
-          { id: "podcast_tts", label: "Generation audio podcast", status: "pending" },
+          { id: "podcast_script", label: "Génération du script podcast", status: "pending" },
+          { id: "podcast_tts", label: "Génération de l’audio podcast", status: "pending" },
         );
       } else {
-        baseSteps.push({ id: "tts", label: "Generation de l'audio", status: "pending" });
+        baseSteps.push({ id: "tts", label: "Génération de l’audio", status: "pending" });
       }
       setSteps(baseSteps);
 
@@ -481,7 +481,7 @@ const Index = () => {
         });
 
         if (!response.ok) {
-          throw new Error("Erreur serveur. Verifiez que le backend est lance.");
+          throw new Error("Erreur serveur. Vérifiez que le backend est lancé.");
         }
 
         await readSSEStream(response, handleSSEEvent);
@@ -517,11 +517,11 @@ const Index = () => {
       }
       if (podcastMode) {
         baseSteps.push(
-          { id: "podcast_script", label: "Generation script podcast", status: "pending" },
-          { id: "podcast_tts", label: "Generation audio podcast", status: "pending" },
+          { id: "podcast_script", label: "Génération du script podcast", status: "pending" },
+          { id: "podcast_tts", label: "Génération de l’audio podcast", status: "pending" },
         );
       } else {
-        baseSteps.push({ id: "tts", label: "Generation de l'audio", status: "pending" });
+        baseSteps.push({ id: "tts", label: "Génération de l’audio", status: "pending" });
       }
       setSteps(baseSteps);
 
@@ -544,7 +544,7 @@ const Index = () => {
         });
 
         if (!response.ok) {
-          throw new Error("Erreur serveur. Verifiez que le backend est lance.");
+          throw new Error("Erreur serveur. Vérifiez que le backend est lancé.");
         }
 
         await readSSEStream(response, handleSSEEvent);
@@ -586,6 +586,7 @@ const Index = () => {
         abortRef.current = new AbortController();
       }
 
+      let hadError = false;
       try {
         await processFile(filesToProcess[i], abortRef.current.signal);
         // Capture this item's final audio so the whole document can be recomposed later.
@@ -595,6 +596,7 @@ const Index = () => {
           setQueueAudioUrls((prev) => [...prev, { fileName: itemName, audioUrl: itemUrl }]);
         }
       } catch (error: any) {
+        hadError = true;
         const msg = describeStreamError(error);
         if (!msg) return; // cancelled by user → stop the queue
         setErrorMessage(msg);
@@ -612,6 +614,9 @@ const Index = () => {
       setIsProcessing(false);
       setIsTtsStreaming(false);
 
+      // Ne compter que les fichiers réellement traités avec succès.
+      if (!hadError) setQueueCompleted((prev) => Math.max(prev, i + 1));
+
       // If there are more files, wait for user to proceed
       if (i < filesToProcess.length - 1) {
         setWaitingForNext(true);
@@ -621,9 +626,6 @@ const Index = () => {
         });
         nextResolveRef.current = null;
         setWaitingForNext(false);
-        setQueueCompleted(i + 1);
-      } else {
-        setQueueCompleted(i + 1);
       }
     }
   };
@@ -678,7 +680,7 @@ const Index = () => {
       case "detecting_language":
         setSteps((prev) =>
           prev.map((s) =>
-            s.id === "translating" ? { ...s, status: "active", label: "Detection de la langue..." } : s
+            s.id === "translating" ? { ...s, status: "active", label: "Détection de la langue…" } : s
           )
         );
         break;
@@ -689,7 +691,7 @@ const Index = () => {
         setSteps((prev) =>
           prev.map((s) =>
             s.id === "translating"
-              ? { ...s, status: "done", label: `Traduction ignoree (deja en ${data.data.detectedLang})` }
+              ? { ...s, status: "done", label: `Traduction ignorée (déjà en ${data.data.detectedLang})` }
               : s
           )
         );
@@ -814,7 +816,7 @@ const Index = () => {
         if (!resumingRef.current && data.data.transcript) setTranscription(data.data.transcript);
         if (data.data.speechStartOffset) setSpeechStartOffset(data.data.speechStartOffset);
         setSteps((prev) => prev.map((s) => ({ ...s, status: "done" })));
-        toast.success("Traitement termine !");
+        toast.success("Traitement terminé !");
         break;
       case "error":
         setErrorMessage(data.message);
@@ -898,8 +900,8 @@ const Index = () => {
     setErrorMessage("");
 
     setSteps([
-      { id: "podcast_script", label: "Generation script podcast", status: "pending" },
-      { id: "podcast_tts", label: "Generation audio podcast", status: "pending" },
+      { id: "podcast_script", label: "Génération du script podcast", status: "pending" },
+      { id: "podcast_tts", label: "Génération de l’audio podcast", status: "pending" },
     ]);
 
     abortRef.current = new AbortController();
@@ -964,11 +966,11 @@ const Index = () => {
 
     if (podcastMode) {
       setSteps([
-        { id: "podcast_script", label: "Generation script podcast", status: "pending" },
-        { id: "podcast_tts", label: "Generation audio podcast", status: "pending" },
+        { id: "podcast_script", label: "Génération du script podcast", status: "pending" },
+        { id: "podcast_tts", label: "Génération de l’audio podcast", status: "pending" },
       ]);
     } else {
-      setSteps([{ id: "tts", label: "Generation de l'audio", status: "pending" }]);
+      setSteps([{ id: "tts", label: "Génération de l’audio", status: "pending" }]);
     }
 
     try {
@@ -1000,7 +1002,7 @@ const Index = () => {
           });
 
       if (!response.ok) {
-        throw new Error("Erreur serveur. Verifiez que le backend est lance.");
+        throw new Error("Erreur serveur. Vérifiez que le backend est lancé.");
       }
       await readSSEStream(response, handleSSEEvent);
     } catch (error) {
@@ -1122,7 +1124,7 @@ const Index = () => {
             </div>
             <div>
               <h1 className="font-display font-bold text-lg text-foreground">
-                VoxTranslate
+                Vocaleez
               </h1>
               <p className="text-xs text-muted-foreground">
                 Transcription & Traduction IA
@@ -1230,7 +1232,7 @@ const Index = () => {
               <textarea
                 value={pastedText}
                 onChange={(e) => setPastedText(e.target.value)}
-                placeholder="Collez votre texte ici pour le traduire et generer l'audio..."
+                placeholder="Collez votre texte ici pour le traduire et générer l'audio…"
                 rows={8}
                 disabled={isProcessing}
                 className="w-full px-4 py-3 rounded-xl bg-muted border border-border text-sm text-foreground placeholder:text-muted-foreground focus:outline-none focus:ring-2 focus:ring-primary/50 resize-y disabled:opacity-50"
@@ -1351,7 +1353,7 @@ const Index = () => {
                       <div className="flex gap-2">
                         {([
                           { value: "formal" as const, label: "Formel" },
-                          { value: "casual" as const, label: "Decontracte" },
+                          { value: "casual" as const, label: "Décontracté" },
                           { value: "humorous" as const, label: "Humoristique" },
                         ]).map(({ value, label }) => (
                           <button
@@ -1394,10 +1396,10 @@ const Index = () => {
                   >
                     {podcastMode ? <Radio className="w-5 h-5" /> : <Mic className="w-5 h-5" />}
                     {podcastMode
-                      ? "Generer Podcast"
+                      ? "Générer le podcast"
                       : inputMode === "file" && selectedFiles.length > 1
-                      ? `Generer audio (${selectedFiles.length} fichiers)`
-                      : "Generer audio"}
+                      ? `Générer l'audio (${selectedFiles.length} fichiers)`
+                      : "Générer l'audio"}
                   </button>
                   <DropdownMenu>
                     <DropdownMenuTrigger asChild>
@@ -1562,12 +1564,12 @@ const Index = () => {
                 <div className="flex-1 space-y-3">
                   <div>
                     <p className="text-sm font-medium text-foreground">
-                      Generation interrompue
+                      Génération interrompue
                     </p>
                     <p className="text-sm text-muted-foreground">
-                      La generation a ete interrompue (mise en veille ?). Vos
-                      textes sont conserves — vous pouvez reprendre sans
-                      reimporter de fichier.
+                      La génération a été interrompue (mise en veille ?). Vos
+                      textes sont conservés — vous pouvez reprendre sans
+                      réimporter de fichier.
                     </p>
                   </div>
                   <div className="flex gap-2 flex-wrap">
@@ -1576,7 +1578,7 @@ const Index = () => {
                       className="flex items-center gap-2 px-4 py-2 rounded-lg bg-primary text-primary-foreground font-medium text-sm hover:opacity-90 transition-all"
                     >
                       <Mic className="w-4 h-4" />
-                      Reprendre la generation audio
+                      Reprendre la génération audio
                     </button>
                     <button
                       onClick={() => {
@@ -1736,7 +1738,7 @@ const Index = () => {
                 className="flex-1 min-w-[200px] py-3 rounded-xl bg-muted border border-border text-foreground font-medium text-sm hover:bg-muted/80 transition-all flex items-center justify-center gap-2"
               >
                 <ImageIcon className="w-4 h-4" />
-                {coverImageUrl ? "Modifier la couverture" : "Generer une couverture"}
+                {coverImageUrl ? "Modifier la couverture" : "Générer une couverture"}
               </button>
 
               {/* Next file button in queue */}
@@ -1816,7 +1818,7 @@ const Index = () => {
                 className="flex items-center gap-2 px-6 py-3 rounded-xl bg-primary text-primary-foreground font-medium text-sm hover:opacity-90 transition-all"
               >
                 <Radio className="w-4 h-4" />
-                Generer le Podcast
+                Générer le podcast
               </button>
             )}
           </div>

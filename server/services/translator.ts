@@ -17,7 +17,7 @@ const LANGUAGE_NAMES: Record<string, string> = {
 
 const CHUNK_SIZE = 3000;
 
-function splitTextIntoChunks(text: string, maxLength: number): string[] {
+export function splitTextIntoChunks(text: string, maxLength: number): string[] {
   const sentences = text.split(/(?<=[.!?])\s+/);
   const chunks: string[] = [];
   let current = '';

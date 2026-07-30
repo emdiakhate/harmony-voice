@@ -21,8 +21,12 @@ import { buildCoverPrompt, generateCoverImage, embedCoverArt, type CoverStyle } 
 import { encrypt, decrypt, maskKey, isEncryptionConfigured } from './lib/crypto.js';
 import { requireAuth } from './lib/auth.js';
 import { prisma } from './lib/prisma.js';
+import { checkSystemDependencies, logDependencyStatus } from './lib/preflight.js';
+import { applyLogLevel } from './lib/logger.js';
 
 config();
+// Applique le seuil LOG_LEVEL (défaut info) dès le chargement des variables d'env.
+applyLogLevel();
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
@@ -896,6 +900,14 @@ app.post('/api/generate-podcast', requireAuth, async (req, res) => {
   res.end();
 });
 
+// Décalage de démarrage de la voix (secondes). Borne [0, 3600] pour éviter des
+// valeurs négatives ou aberrantes qui feraient planter ffmpeg.
+function clampSpeechOffset(value: unknown): number {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return 0;
+  return Math.min(3600, Math.max(0, n));
+}
+
 // ===== Merge video + translated audio =====
 app.post('/api/merge-video', requireAuth, async (req, res) => {
   const { videoId, audioUrl, targetLanguage, speechStartOffset } = req.body;
@@ -921,7 +933,7 @@ app.post('/api/merge-video', requireAuth, async (req, res) => {
     const mergedPath = path.join(videoOutputDir, mergedFileName);
 
     console.log(`[Merge] Merging video + translated audio...`);
-    await mergeVideoAudio(videoPath, audioPath, mergedPath, targetLanguage, speechStartOffset || 0);
+    await mergeVideoAudio(videoPath, audioPath, mergedPath, targetLanguage, clampSpeechOffset(speechStartOffset));
 
     cleanupAudioFile(videoPath);
 
@@ -964,7 +976,7 @@ app.post('/api/merge-local-video', requireAuth, async (req, res) => {
     const mergedPath = path.join(videoOutputDir, mergedFileName);
 
     console.log(`[MergeLocal] Merging ${videoFileName} + ${audioFileName}...`);
-    await mergeVideoAudio(videoPath, audioPath, mergedPath, targetLanguage, speechStartOffset || 0);
+    await mergeVideoAudio(videoPath, audioPath, mergedPath, targetLanguage, clampSpeechOffset(speechStartOffset));
 
     const stats = fs.statSync(mergedPath);
     console.log(`[MergeLocal] Done: ${mergedFileName} (${(stats.size / 1024 / 1024).toFixed(1)}MB)`);
@@ -986,7 +998,11 @@ app.post('/api/split-pdf', requireAuth, upload.single('file'), async (req, res) 
     return res.status(400).json({ error: 'Aucun fichier fourni.' });
   }
 
-  const pagesPerChunk = Math.max(1, parseInt(req.body.pagesPerChunk || '12', 10));
+  // Borne 1–100 avec repli sur 12 si valeur absente/non numérique (parseInt → NaN).
+  const parsedPages = parseInt(req.body.pagesPerChunk, 10);
+  const pagesPerChunk = Number.isNaN(parsedPages)
+    ? 12
+    : Math.min(100, Math.max(1, parsedPages));
 
   try {
     const { PDFDocument } = await import('pdf-lib');
@@ -1352,25 +1368,36 @@ async function testProviderKey(provider: string, key: string): Promise<boolean> 
       url = "https://api.elevenlabs.io/v1/user";
       headers["xi-api-key"] = key;
       break;
-    case "claude":
-      url = "https://api.anthropic.com/v1/models";
-      headers["x-api-key"] = key;
-      headers["anthropic-version"] = "2023-06-01";
-      break;
     default:
       return false;
   }
   try {
-    const r = await fetch(url, { headers });
+    // Timeout pour ne pas bloquer si le fournisseur ne répond pas.
+    const r = await fetch(url, { headers, signal: AbortSignal.timeout(8000) });
     return r.ok;
   } catch {
     return false;
   }
 }
 
+// Rate-limit léger en mémoire pour /test-key (endpoint sans auth). Usage local,
+// simple garde-fou contre les appels en boucle.
+const testKeyHits: number[] = [];
+function testKeyRateLimited(): boolean {
+  const now = Date.now();
+  while (testKeyHits.length && now - testKeyHits[0] > 10_000) testKeyHits.shift();
+  if (testKeyHits.length >= 15) return true;
+  testKeyHits.push(now);
+  return false;
+}
+
 app.post('/api/settings/test-key', async (req, res) => {
+  if (testKeyRateLimited()) {
+    res.status(429).json({ valid: false, error: 'Trop de tests. Réessayez dans quelques secondes.' });
+    return;
+  }
   const { provider, key } = req.body as { provider: string; key: string };
-  if (!provider || !key) {
+  if (!provider || typeof provider !== 'string' || !key || typeof key !== 'string') {
     res.json({ valid: false });
     return;
   }
@@ -1440,6 +1467,7 @@ app.delete('/api/settings/keys/:id', requireAuth, async (req, res) => {
 
 // Health check
 app.get('/api/health', (_req, res) => {
+  const deps = checkSystemDependencies();
   res.json({
     status: 'ok',
     openai: !!process.env.OPENAI_API_KEY,
@@ -1448,6 +1476,9 @@ app.get('/api/health', (_req, res) => {
     openrouter: !!process.env.OPENROUTER_API_KEY,
     elevenlabs: !!process.env.ELEVENLABS_API_KEY,
     piper: getPiperStatus(),
+    // Dépendances système externes (voir server/lib/preflight.ts).
+    ffmpeg: deps.ffmpeg,
+    ytdlp: deps.ytdlp,
   });
 });
 
@@ -1475,4 +1506,5 @@ app.listen(PORT, () => {
   console.log(`[Priority] Translation/LLM: Groq > OpenRouter > OpenAI`);
   console.log(`[Priority] TTS: ElevenLabs > OpenAI > Gemini > Edge TTS (free) | Podcast TTS: Gemini > ElevenLabs > OpenAI`);
   console.log(`[Priority] Whisper: Groq > OpenAI`);
+  logDependencyStatus();
 });

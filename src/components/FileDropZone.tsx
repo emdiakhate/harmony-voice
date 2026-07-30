@@ -1,6 +1,21 @@
 import { useState, useCallback } from "react";
 import { Upload, X, FileAudio, FileVideo, FileText } from "lucide-react";
 import { motion } from "framer-motion";
+import { toast } from "sonner";
+
+// Doit rester aligné avec la limite multer du serveur (200 Mo).
+const MAX_FILE_SIZE = 200 * 1024 * 1024;
+
+/** Écarte les fichiers dépassant la limite et prévient l'utilisateur, avant tout upload. */
+function filterBySize(files: File[]): File[] {
+  const tooBig = files.filter((f) => f.size > MAX_FILE_SIZE);
+  if (tooBig.length > 0) {
+    toast.error(
+      `Fichier trop volumineux (max 200 Mo) : ${tooBig.map((f) => f.name).join(", ")}`
+    );
+  }
+  return files.filter((f) => f.size <= MAX_FILE_SIZE);
+}
 
 interface FileDropZoneProps {
   onFilesSelect: (files: File[]) => void;
@@ -63,14 +78,14 @@ const FileDropZone = ({
       e.preventDefault();
       setIsDragging(false);
       if (disabled) return;
-      const files = Array.from(e.dataTransfer.files);
+      const files = filterBySize(Array.from(e.dataTransfer.files));
       if (files.length > 0) onFilesSelect(files);
     },
     [onFilesSelect, disabled]
   );
 
   const handleFileInput = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const files = Array.from(e.target.files || []);
+    const files = filterBySize(Array.from(e.target.files || []));
     if (files.length > 0) onFilesSelect(files);
     e.target.value = "";
   };

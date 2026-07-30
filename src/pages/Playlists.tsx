@@ -285,7 +285,7 @@ export default function Playlists() {
       {addingToPlaylist === video.id && playlists.length > 0 && (
         <div className="absolute right-0 top-full z-10 bg-card border border-border rounded-lg shadow-lg p-2 min-w-[200px]">
           <div className="flex items-center justify-between px-2 pb-2 border-b border-border mb-1">
-            <span className="text-xs font-medium">Ajouter a...</span>
+            <span className="text-xs font-medium">Ajouter à…</span>
             <button
               onClick={() => setAddingToPlaylist(null)}
               className="text-muted-foreground hover:text-foreground"
