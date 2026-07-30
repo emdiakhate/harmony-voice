@@ -42,6 +42,8 @@ npm run dev
 
 `npm run dev` synchronise automatiquement la base (`prisma db push`) puis lance le frontend et l'API. Ouvrez l'URL indiquée par Vite (par défaut http://localhost:8080).
 
+> 🧪 Pour tester l'application pas à pas (installation à froid + chaque fonctionnalité), suivez le [guide de test](./TESTING.md).
+
 **Lancement en un seul service** (build + serveur sur un seul port) :
 
 ```sh
