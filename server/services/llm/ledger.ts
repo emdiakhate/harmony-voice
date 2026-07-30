@@ -85,9 +85,12 @@ export function isAvailable(provider: LlmProviderDef, model: string, keyId: stri
   rollWindows(e, now);
 
   if (e.cooldownUntil > now) return false;
-  // Le cooldown est expiré : on repasse l'état à healthy.
-  if (e.status === 'cooldown' || e.status === 'rate_limited') e.status = 'healthy';
-  if (e.status === 'invalid') return false; // clé invalide : écartée jusqu'à expiration du cooldown ci-dessus
+  // Le cooldown est expiré : on repasse l'état à healthy et on autorise une
+  // nouvelle tentative (y compris pour une clé marquée invalide — elle a pu
+  // être régénérée entre-temps, et le long cooldown 401 limite déjà la casse).
+  if (e.status === 'cooldown' || e.status === 'rate_limited' || e.status === 'invalid') {
+    e.status = 'healthy';
+  }
 
   if (provider.rpm && e.rpmCount >= provider.rpm) return false;
   if (provider.rpd && e.rpdCount >= provider.rpd) return false;

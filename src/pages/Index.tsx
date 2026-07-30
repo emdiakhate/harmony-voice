@@ -1,4 +1,4 @@
-import { useState, useRef, useCallback } from "react";
+import { useState, useRef, useCallback, useEffect } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import {
   FileAudio,
@@ -24,6 +24,7 @@ import {
   Users,
   MessageSquare,
   ChevronDown,
+  Image as ImageIcon,
 } from "lucide-react";
 import FileDropZone from "@/components/FileDropZone";
 import LanguageSelector from "@/components/LanguageSelector";
@@ -32,6 +33,7 @@ import YouTubePlayer from "@/components/YouTubePlayer";
 import LocalVideoPlayer from "@/components/LocalVideoPlayer";
 import AudioPlayer from "@/components/AudioPlayer";
 import SaveDialog from "@/components/SaveDialog";
+import CoverDialog from "@/components/CoverDialog";
 import UserMenu from "@/components/UserMenu";
 import AudioCombiner from "@/components/AudioCombiner";
 import {
@@ -43,6 +45,13 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { toast } from "sonner";
 import { useSettings, buildLlmConfig, buildTaskConfig } from "@/hooks/useSettings";
+import {
+  saveSession,
+  loadSession,
+  clearSession,
+  hasContent,
+  type SessionSnapshot,
+} from "@/lib/sessionStore";
 
 type InputMode = "file" | "url" | "text" | "combine";
 
@@ -73,22 +82,32 @@ async function readSSEStream(
   const decoder = new TextDecoder();
   let buffer = "";
 
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
 
-    buffer += decoder.decode(value, { stream: true });
-    const lines = buffer.split("\n\n");
-    buffer = lines.pop() || "";
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split("\n\n");
+      buffer = lines.pop() || "";
 
-    for (const line of lines) {
-      if (!line.startsWith("data: ")) continue;
-      try {
-        onEvent(JSON.parse(line.slice(6)));
-      } catch {
-        // Skip malformed events
+      for (const line of lines) {
+        if (!line.startsWith("data: ")) continue;
+        try {
+          onEvent(JSON.parse(line.slice(6)));
+        } catch {
+          // Skip malformed events
+        }
       }
     }
+  } catch (err) {
+    // User cancellation → propagate as-is so callers can ignore it.
+    if ((err as Error)?.name === "AbortError") throw err;
+    // Connection dropped mid-stream (e.g. the machine went to sleep and the
+    // TCP socket was suspended). Tag it so callers show a recoverable message.
+    const connErr = new Error("Connexion interrompue") as Error & { cause?: string };
+    connErr.cause = "connection-lost";
+    throw connErr;
   }
 
   if (buffer.startsWith("data: ")) {
@@ -100,10 +119,25 @@ async function readSSEStream(
   }
 }
 
+// Builds a user-facing message for a failed stream. Returns null when the
+// failure is a user-initiated cancellation (nothing to show).
+function describeStreamError(error: unknown): string | null {
+  const e = error as { name?: string; message?: string; cause?: unknown };
+  if (e?.name === "AbortError") return null;
+  if (e?.cause === "connection-lost")
+    return "Connexion interrompue (veille ?). Vos textes sont conservés — cliquez sur « Reprendre ».";
+  if (e?.message?.includes("Failed to fetch"))
+    return "Impossible de contacter le serveur. Lancez le backend avec: npm run dev:server";
+  return e?.message || "Erreur de connexion au serveur";
+}
+
 const Index = () => {
   const { settings } = useSettings();
   const [inputMode, setInputMode] = useState<InputMode>("url");
   const [selectedFiles, setSelectedFiles] = useState<File[]>([]);
+  // Actual processing units: a large PDF is split into several parts here,
+  // WITHOUT replacing `selectedFiles` (so the original file stays visible).
+  const [queueFiles, setQueueFiles] = useState<File[]>([]);
   const [youtubeUrl, setYoutubeUrl] = useState("");
   const [sourceLang, setSourceLang] = useState("auto");
   const [targetLang, setTargetLang] = useState("fr");
@@ -117,7 +151,13 @@ const Index = () => {
   const [speechStartOffset, setSpeechStartOffset] = useState(0);
   const [steps, setSteps] = useState<ProcessingStep[]>([]);
   const [errorMessage, setErrorMessage] = useState("");
+  // A generation was interrupted (sleep / reload) and can be resumed from text.
+  const [interrupted, setInterrupted] = useState(false);
   const abortRef = useRef<AbortController | null>(null);
+  const restoredRef = useRef(false);
+  // While resuming, audio is regenerated from existing text — don't let the
+  // stream's text events overwrite the original transcription/translation.
+  const resumingRef = useRef(false);
 
   // Generation mode (audio vs podcast)
   const [generationMode, setGenerationMode] = useState<"audio" | "podcast">("audio");
@@ -135,6 +175,10 @@ const Index = () => {
 
   // Save dialog
   const [showSaveDialog, setShowSaveDialog] = useState(false);
+
+  // Cover image (audiobook-style thumbnail)
+  const [coverImageUrl, setCoverImageUrl] = useState("");
+  const [showCoverDialog, setShowCoverDialog] = useState(false);
 
   // Local video preview (uploaded video files)
   const [localVideoUrl, setLocalVideoUrl] = useState("");
@@ -168,8 +212,21 @@ const Index = () => {
   const [waitingForNext, setWaitingForNext] = useState(false);
   const [queueCompleted, setQueueCompleted] = useState(0);
 
-  const isQueueMode = inputMode === "file" && selectedFiles.length > 1;
-  const currentFile = inputMode === "file" ? selectedFiles[queueIndex] : null;
+  // Recompose the full audio from each queue item's final audio.
+  // `resetResultState()` wipes `audioUrl` between items, so we capture each item's
+  // result here to offer the user a single combined audio at the end of the queue.
+  const [queueAudioUrls, setQueueAudioUrls] = useState<{ fileName: string; audioUrl: string }[]>([]);
+  const [combinedAudioUrl, setCombinedAudioUrl] = useState("");
+  const [isCombining, setIsCombining] = useState(false);
+  // Last final audioUrl produced by the current queue item (ref avoids stale-closure
+  // reads of React state inside the `processFileQueue` loop).
+  const lastAudioUrlRef = useRef<string>("");
+
+  // The list actually being processed (PDF parts when split, else the originals).
+  // `selectedFiles` always keeps the user's original files for display.
+  const processingQueue = queueFiles.length > 0 ? queueFiles : selectedFiles;
+  const isQueueMode = inputMode === "file" && processingQueue.length > 1;
+  const currentFile = inputMode === "file" ? processingQueue[queueIndex] : null;
 
   const resetResultState = useCallback(() => {
     setTranscription("");
@@ -182,10 +239,85 @@ const Index = () => {
     setPodcastScript("");
     setSummary("");
     setShowSaveDialog(false);
+    setCoverImageUrl("");
+    setShowCoverDialog(false);
     setLocalVideoUrl("");
     setSteps([]);
     setWaitingForNext(false);
+    setInterrupted(false);
   }, []);
+
+  // --- Session persistence: survive a reload (e.g. Vite HMR reload after the
+  // machine wakes from sleep) without losing work or re-uploading the file. ---
+
+  // Restore the previous session once, on mount.
+  useEffect(() => {
+    if (restoredRef.current) return;
+    restoredRef.current = true;
+    const snap = loadSession();
+    if (!hasContent(snap)) return;
+    setInputMode(snap.inputMode as InputMode);
+    setSourceLang(snap.sourceLang);
+    setTargetLang(snap.targetLang);
+    setGenerationMode(snap.generationMode);
+    setTranscription(snap.transcription);
+    setTranslation(snap.translation);
+    setSummary(snap.summary);
+    setPodcastScript(snap.podcastScript);
+    setAudioUrl(snap.audioUrl);
+    setAudioChunks(snap.audioChunks || []);
+    setCoverImageUrl(snap.coverImageUrl || "");
+    setQueueAudioUrls(snap.queueAudioUrls || []);
+    setCombinedAudioUrl(snap.combinedAudioUrl || "");
+    setVideoId(snap.videoId);
+    setLocalVideoUrl(snap.localVideoUrl);
+    // Generation was still running when the page was lost → offer to resume.
+    if (snap.status === "processing") setInterrupted(true);
+    toast.info("Session précédente restaurée");
+  }, []);
+
+  // Persist the working session whenever results change.
+  useEffect(() => {
+    const snapshot: SessionSnapshot = {
+      inputMode,
+      sourceLang,
+      targetLang,
+      generationMode,
+      transcription,
+      translation,
+      summary,
+      podcastScript,
+      audioUrl,
+      audioChunks,
+      coverImageUrl,
+      queueAudioUrls,
+      combinedAudioUrl,
+      videoId,
+      localVideoUrl,
+      originalFileNames: selectedFiles.map((f) => f.name),
+      status: isProcessing ? "processing" : audioUrl ? "done" : "idle",
+      savedAt: Date.now(),
+    };
+    if (hasContent(snapshot) || isProcessing) saveSession(snapshot);
+  }, [
+    inputMode,
+    sourceLang,
+    targetLang,
+    generationMode,
+    transcription,
+    translation,
+    summary,
+    podcastScript,
+    audioUrl,
+    audioChunks,
+    coverImageUrl,
+    queueAudioUrls,
+    combinedAudioUrl,
+    videoId,
+    localVideoUrl,
+    selectedFiles,
+    isProcessing,
+  ]);
 
   const splitPdfsInQueue = async (files: File[]): Promise<File[]> => {
     const result: File[] = [];
@@ -239,11 +371,11 @@ const Index = () => {
 
     if (podcastMode) {
       baseSteps.push(
-        { id: "podcast_script", label: "Generation script podcast", status: "pending" },
-        { id: "podcast_tts", label: "Generation audio podcast", status: "pending" },
+        { id: "podcast_script", label: "Génération du script podcast", status: "pending" },
+        { id: "podcast_tts", label: "Génération de l’audio podcast", status: "pending" },
       );
     } else {
-      baseSteps.push({ id: "tts", label: "Generation de l'audio", status: "pending" });
+      baseSteps.push({ id: "tts", label: "Génération de l’audio", status: "pending" });
     }
     setSteps(baseSteps);
 
@@ -272,7 +404,7 @@ const Index = () => {
     });
 
     if (!response.ok) {
-      throw new Error("Erreur serveur. Verifiez que le backend est lance.");
+      throw new Error("Erreur serveur. Vérifiez que le backend est lancé.");
     }
 
     await readSSEStream(response, handleSSEEvent);
@@ -305,8 +437,11 @@ const Index = () => {
     // Reset state
     setIsProcessing(true);
     resetResultState();
+    setQueueFiles([]);
     setQueueIndex(0);
     setQueueCompleted(0);
+    setQueueAudioUrls([]);
+    setCombinedAudioUrl("");
 
     abortRef.current = new AbortController();
 
@@ -320,11 +455,11 @@ const Index = () => {
       }
       if (podcastMode) {
         baseSteps.push(
-          { id: "podcast_script", label: "Generation script podcast", status: "pending" },
-          { id: "podcast_tts", label: "Generation audio podcast", status: "pending" },
+          { id: "podcast_script", label: "Génération du script podcast", status: "pending" },
+          { id: "podcast_tts", label: "Génération de l’audio podcast", status: "pending" },
         );
       } else {
-        baseSteps.push({ id: "tts", label: "Generation de l'audio", status: "pending" });
+        baseSteps.push({ id: "tts", label: "Génération de l’audio", status: "pending" });
       }
       setSteps(baseSteps);
 
@@ -346,15 +481,13 @@ const Index = () => {
         });
 
         if (!response.ok) {
-          throw new Error("Erreur serveur. Verifiez que le backend est lance.");
+          throw new Error("Erreur serveur. Vérifiez que le backend est lancé.");
         }
 
         await readSSEStream(response, handleSSEEvent);
       } catch (error: any) {
-        if (error.name !== "AbortError") {
-          const msg = error.message?.includes("Failed to fetch")
-            ? "Impossible de contacter le serveur. Lancez le backend avec: npm run dev:server"
-            : error.message || "Erreur de connexion au serveur";
+        const msg = describeStreamError(error);
+        if (msg) {
           setErrorMessage(msg);
           setSteps((prev) =>
             prev.map((s) =>
@@ -363,6 +496,7 @@ const Index = () => {
                 : s
             )
           );
+          if (error?.cause === "connection-lost") setInterrupted(true);
           toast.error(msg);
         }
       } finally {
@@ -383,11 +517,11 @@ const Index = () => {
       }
       if (podcastMode) {
         baseSteps.push(
-          { id: "podcast_script", label: "Generation script podcast", status: "pending" },
-          { id: "podcast_tts", label: "Generation audio podcast", status: "pending" },
+          { id: "podcast_script", label: "Génération du script podcast", status: "pending" },
+          { id: "podcast_tts", label: "Génération de l’audio podcast", status: "pending" },
         );
       } else {
-        baseSteps.push({ id: "tts", label: "Generation de l'audio", status: "pending" });
+        baseSteps.push({ id: "tts", label: "Génération de l’audio", status: "pending" });
       }
       setSteps(baseSteps);
 
@@ -410,15 +544,13 @@ const Index = () => {
         });
 
         if (!response.ok) {
-          throw new Error("Erreur serveur. Verifiez que le backend est lance.");
+          throw new Error("Erreur serveur. Vérifiez que le backend est lancé.");
         }
 
         await readSSEStream(response, handleSSEEvent);
       } catch (error: any) {
-        if (error.name !== "AbortError") {
-          const msg = error.message?.includes("Failed to fetch")
-            ? "Impossible de contacter le serveur. Lancez le backend avec: npm run dev:server"
-            : error.message || "Erreur de connexion au serveur";
+        const msg = describeStreamError(error);
+        if (msg) {
           setErrorMessage(msg);
           setSteps((prev) =>
             prev.map((s) =>
@@ -427,6 +559,7 @@ const Index = () => {
                 : s
             )
           );
+          if (error?.cause === "connection-lost") setInterrupted(true);
           toast.error(msg);
         }
       } finally {
@@ -434,11 +567,10 @@ const Index = () => {
         setIsTtsStreaming(false);
       }
     } else {
-      // File mode: auto-split large PDFs then process queue
+      // File mode: auto-split large PDFs into a SEPARATE processing queue,
+      // without replacing the user's original files (so they stay visible).
       const expandedFiles = await splitPdfsInQueue(selectedFiles);
-      if (expandedFiles.length !== selectedFiles.length) {
-        setSelectedFiles(expandedFiles);
-      }
+      setQueueFiles(expandedFiles);
       await processFileQueue(0, expandedFiles);
     }
   };
@@ -447,19 +579,26 @@ const Index = () => {
     for (let i = startIndex; i < filesToProcess.length; i++) {
       setQueueIndex(i);
       resetResultState();
+      lastAudioUrlRef.current = "";
       setIsProcessing(true);
 
       if (!abortRef.current || abortRef.current.signal.aborted) {
         abortRef.current = new AbortController();
       }
 
+      let hadError = false;
       try {
         await processFile(filesToProcess[i], abortRef.current.signal);
+        // Capture this item's final audio so the whole document can be recomposed later.
+        if (lastAudioUrlRef.current) {
+          const itemUrl = lastAudioUrlRef.current;
+          const itemName = filesToProcess[i].name;
+          setQueueAudioUrls((prev) => [...prev, { fileName: itemName, audioUrl: itemUrl }]);
+        }
       } catch (error: any) {
-        if (error.name === "AbortError") return;
-        const msg = error.message?.includes("Failed to fetch")
-          ? "Impossible de contacter le serveur. Lancez le backend avec: npm run dev:server"
-          : error.message || "Erreur de connexion au serveur";
+        hadError = true;
+        const msg = describeStreamError(error);
+        if (!msg) return; // cancelled by user → stop the queue
         setErrorMessage(msg);
         setSteps((prev) =>
           prev.map((s) =>
@@ -468,11 +607,15 @@ const Index = () => {
               : s
           )
         );
+        if (error?.cause === "connection-lost") setInterrupted(true);
         toast.error(msg);
       }
 
       setIsProcessing(false);
       setIsTtsStreaming(false);
+
+      // Ne compter que les fichiers réellement traités avec succès.
+      if (!hadError) setQueueCompleted((prev) => Math.max(prev, i + 1));
 
       // If there are more files, wait for user to proceed
       if (i < filesToProcess.length - 1) {
@@ -483,9 +626,6 @@ const Index = () => {
         });
         nextResolveRef.current = null;
         setWaitingForNext(false);
-        setQueueCompleted(i + 1);
-      } else {
-        setQueueCompleted(i + 1);
       }
     }
   };
@@ -517,7 +657,7 @@ const Index = () => {
         );
         break;
       case "transcript_done":
-        setTranscription(data.data.transcript);
+        if (!resumingRef.current) setTranscription(data.data.transcript);
         setSteps((prev) =>
           prev.map((s) => (s.id === "transcript" ? { ...s, status: "done" } : s))
         );
@@ -530,7 +670,7 @@ const Index = () => {
         );
         break;
       case "extract_done":
-        setTranscription(data.data.text);
+        if (!resumingRef.current) setTranscription(data.data.text);
         setSteps((prev) =>
           prev.map((s) => (s.id === "extract" ? { ...s, status: "done" } : s))
         );
@@ -540,7 +680,7 @@ const Index = () => {
       case "detecting_language":
         setSteps((prev) =>
           prev.map((s) =>
-            s.id === "translating" ? { ...s, status: "active", label: "Detection de la langue..." } : s
+            s.id === "translating" ? { ...s, status: "active", label: "Détection de la langue…" } : s
           )
         );
         break;
@@ -551,7 +691,7 @@ const Index = () => {
         setSteps((prev) =>
           prev.map((s) =>
             s.id === "translating"
-              ? { ...s, status: "done", label: `Traduction ignoree (deja en ${data.data.detectedLang})` }
+              ? { ...s, status: "done", label: `Traduction ignorée (déjà en ${data.data.detectedLang})` }
               : s
           )
         );
@@ -612,6 +752,7 @@ const Index = () => {
         setIsTtsStreaming(false);
         if (data.data.audioUrl) {
           setAudioUrl(data.data.audioUrl);
+          lastAudioUrlRef.current = data.data.audioUrl;
         }
         setSteps((prev) =>
           prev.map((s) =>
@@ -664,15 +805,18 @@ const Index = () => {
         break;
 
       case "done":
-        if (data.data.audioUrl) setAudioUrl(data.data.audioUrl);
+        if (data.data.audioUrl) {
+          setAudioUrl(data.data.audioUrl);
+          lastAudioUrlRef.current = data.data.audioUrl;
+        }
         setIsTtsStreaming(false);
         if (data.data.videoId) setVideoId(data.data.videoId);
         if (data.data.localVideoUrl) setLocalVideoUrl(data.data.localVideoUrl);
         if (data.data.translatedText) setTranslation(data.data.translatedText);
-        if (data.data.transcript) setTranscription(data.data.transcript);
+        if (!resumingRef.current && data.data.transcript) setTranscription(data.data.transcript);
         if (data.data.speechStartOffset) setSpeechStartOffset(data.data.speechStartOffset);
         setSteps((prev) => prev.map((s) => ({ ...s, status: "done" })));
-        toast.success("Traitement termine !");
+        toast.success("Traitement terminé !");
         break;
       case "error":
         setErrorMessage(data.message);
@@ -751,12 +895,13 @@ const Index = () => {
     setIsProcessing(true);
     setAudioUrl("");
     setAudioChunks([]);
+    setCoverImageUrl("");
     setPodcastScript("");
     setErrorMessage("");
 
     setSteps([
-      { id: "podcast_script", label: "Generation script podcast", status: "pending" },
-      { id: "podcast_tts", label: "Generation audio podcast", status: "pending" },
+      { id: "podcast_script", label: "Génération du script podcast", status: "pending" },
+      { id: "podcast_tts", label: "Génération de l’audio podcast", status: "pending" },
     ]);
 
     abortRef.current = new AbortController();
@@ -781,8 +926,8 @@ const Index = () => {
 
       await readSSEStream(response, handleSSEEvent);
     } catch (error: any) {
-      if (error.name !== "AbortError") {
-        const msg = error.message || "Erreur de connexion au serveur";
+      const msg = describeStreamError(error);
+      if (msg) {
         setErrorMessage(msg);
         setSteps((prev) =>
           prev.map((s) =>
@@ -791,10 +936,94 @@ const Index = () => {
               : s
           )
         );
+        if (error?.cause === "connection-lost") setInterrupted(true);
         toast.error(msg);
       }
     } finally {
       setIsProcessing(false);
+    }
+  };
+
+  // Resume audio generation from the already-available text (no file needed).
+  // Used after a sleep/reload interruption. If a translation already exists we
+  // re-run TTS only; otherwise we translate the original text first. Either way
+  // no file re-upload is needed — we go through /api/process-text.
+  const handleResume = async () => {
+    const hasTranslation = translation.trim().length > 0;
+    const text = hasTranslation ? translation : transcription;
+    if (!text.trim()) {
+      toast.error("Aucun texte a reprendre");
+      return;
+    }
+    setInterrupted(false);
+    setIsProcessing(true);
+    setAudioUrl("");
+    setAudioChunks([]);
+    setCoverImageUrl("");
+    setErrorMessage("");
+    abortRef.current = new AbortController();
+    resumingRef.current = true;
+
+    if (podcastMode) {
+      setSteps([
+        { id: "podcast_script", label: "Génération du script podcast", status: "pending" },
+        { id: "podcast_tts", label: "Génération de l’audio podcast", status: "pending" },
+      ]);
+    } else {
+      setSteps([{ id: "tts", label: "Génération de l’audio", status: "pending" }]);
+    }
+
+    try {
+      const response = podcastMode
+        ? await fetch("/api/generate-podcast", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              translatedText: text,
+              podcastTone,
+              podcastSpeakerCount,
+              llmConfig: buildLlmConfig(settings),
+              ttsConfig: buildTaskConfig(settings, "tts"),
+            }),
+            signal: abortRef.current.signal,
+          })
+        : await fetch("/api/process-text", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              text,
+              targetLanguage: targetLang,
+              podcastMode: false,
+              skipTranslation: hasTranslation,
+              llmConfig: buildLlmConfig(settings),
+              ttsConfig: buildTaskConfig(settings, "tts"),
+            }),
+            signal: abortRef.current.signal,
+          });
+
+      if (!response.ok) {
+        throw new Error("Erreur serveur. Vérifiez que le backend est lancé.");
+      }
+      await readSSEStream(response, handleSSEEvent);
+    } catch (error) {
+      const msg = describeStreamError(error);
+      if (msg) {
+        setErrorMessage(msg);
+        setSteps((prev) =>
+          prev.map((s) =>
+            s.status === "active" || s.status === "pending"
+              ? { ...s, status: "error" }
+              : s
+          )
+        );
+        if ((error as { cause?: string })?.cause === "connection-lost")
+          setInterrupted(true);
+        toast.error(msg);
+      }
+    } finally {
+      setIsProcessing(false);
+      setIsTtsStreaming(false);
+      resumingRef.current = false;
     }
   };
 
@@ -834,8 +1063,41 @@ const Index = () => {
 
   const handleClearFiles = () => {
     setSelectedFiles([]);
+    setQueueFiles([]);
+    setQueueAudioUrls([]);
+    setCombinedAudioUrl("");
     setUserTranscript("");
     setSkipTranslation(false);
+    setInterrupted(false);
+    clearSession();
+  };
+
+  // Recompose one full audio from every queue item's audio (server-side ffmpeg merge).
+  const handleCombineChunks = async () => {
+    if (queueAudioUrls.length < 2) return;
+    setIsCombining(true);
+    try {
+      const baseName = selectedFiles[0]?.name?.replace(/\.[^.]+$/, "") || "document";
+      const response = await fetch("/api/combine-chunks", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          audioUrls: queueAudioUrls.map((q) => q.audioUrl),
+          fileName: baseName,
+        }),
+      });
+      if (!response.ok) {
+        const err = await response.json().catch(() => ({}));
+        throw new Error(err.error || "Erreur lors de la recomposition de l'audio");
+      }
+      const data = await response.json();
+      setCombinedAudioUrl(data.audioUrl);
+      toast.success(`Audio complet recomposé (${data.partCount} parties, ${data.fileSize})`);
+    } catch (error: any) {
+      toast.error(error.message || "Erreur lors de la recomposition de l'audio");
+    } finally {
+      setIsCombining(false);
+    }
   };
 
   const previewVideoId =
@@ -862,7 +1124,7 @@ const Index = () => {
             </div>
             <div>
               <h1 className="font-display font-bold text-lg text-foreground">
-                VoxTranslate
+                Vocaleez
               </h1>
               <p className="text-xs text-muted-foreground">
                 Transcription & Traduction IA
@@ -970,7 +1232,7 @@ const Index = () => {
               <textarea
                 value={pastedText}
                 onChange={(e) => setPastedText(e.target.value)}
-                placeholder="Collez votre texte ici pour le traduire et generer l'audio..."
+                placeholder="Collez votre texte ici pour le traduire et générer l'audio…"
                 rows={8}
                 disabled={isProcessing}
                 className="w-full px-4 py-3 rounded-xl bg-muted border border-border text-sm text-foreground placeholder:text-muted-foreground focus:outline-none focus:ring-2 focus:ring-primary/50 resize-y disabled:opacity-50"
@@ -1091,7 +1353,7 @@ const Index = () => {
                       <div className="flex gap-2">
                         {([
                           { value: "formal" as const, label: "Formel" },
-                          { value: "casual" as const, label: "Decontracte" },
+                          { value: "casual" as const, label: "Décontracté" },
                           { value: "humorous" as const, label: "Humoristique" },
                         ]).map(({ value, label }) => (
                           <button
@@ -1134,10 +1396,10 @@ const Index = () => {
                   >
                     {podcastMode ? <Radio className="w-5 h-5" /> : <Mic className="w-5 h-5" />}
                     {podcastMode
-                      ? "Generer Podcast"
+                      ? "Générer le podcast"
                       : inputMode === "file" && selectedFiles.length > 1
-                      ? `Generer audio (${selectedFiles.length} fichiers)`
-                      : "Generer audio"}
+                      ? `Générer l'audio (${selectedFiles.length} fichiers)`
+                      : "Générer l'audio"}
                   </button>
                   <DropdownMenu>
                     <DropdownMenuTrigger asChild>
@@ -1186,17 +1448,17 @@ const Index = () => {
                   File d'attente
                 </p>
                 <p className="text-sm text-muted-foreground">
-                  {Math.min(queueIndex + 1, selectedFiles.length)} / {selectedFiles.length}
+                  {Math.min(queueIndex + 1, processingQueue.length)} / {processingQueue.length}
                 </p>
               </div>
               <div className="w-full h-2 bg-muted rounded-full overflow-hidden">
                 <div
                   className="h-full bg-primary rounded-full transition-all duration-500"
-                  style={{ width: `${(queueCompleted / selectedFiles.length) * 100}%` }}
+                  style={{ width: `${(queueCompleted / processingQueue.length) * 100}%` }}
                 />
               </div>
               <div className="mt-2 flex flex-wrap gap-1.5">
-                {selectedFiles.map((file, i) => (
+                {processingQueue.map((file, i) => (
                   <span
                     key={i}
                     className={`text-xs px-2 py-1 rounded-md ${
@@ -1215,6 +1477,64 @@ const Index = () => {
           )}
         </AnimatePresence>
 
+        {/* Recompose full audio from all queue parts. Not gated on `isQueueMode`
+            so it also shows after a reload, where the (unserializable) File queue
+            is gone but `queueAudioUrls` was restored from the session snapshot. */}
+        <AnimatePresence>
+          {!isProcessing &&
+            !waitingForNext &&
+            queueAudioUrls.length >= 2 &&
+            !combinedAudioUrl && (
+              <motion.section
+                initial={{ opacity: 0, y: 10 }}
+                animate={{ opacity: 1, y: 0 }}
+                exit={{ opacity: 0, height: 0 }}
+                className="glass-card p-4 border border-primary/30"
+              >
+                <p className="text-sm text-foreground mb-1 flex items-center gap-2">
+                  <Music className="w-4 h-4 text-primary" />
+                  Recomposer l'audio complet
+                </p>
+                <p className="text-xs text-muted-foreground mb-3">
+                  Assemble les {queueAudioUrls.length} parties générées en un seul fichier audio téléchargeable.
+                </p>
+                <button
+                  onClick={handleCombineChunks}
+                  disabled={isCombining}
+                  className="w-full py-3 rounded-xl bg-primary text-primary-foreground font-medium text-sm hover:opacity-90 transition-all flex items-center justify-center gap-2 disabled:opacity-60"
+                >
+                  {isCombining ? (
+                    <>
+                      <Loader2 className="w-4 h-4 animate-spin" />
+                      Assemblage en cours...
+                    </>
+                  ) : (
+                    <>
+                      <Music className="w-4 h-4" />
+                      Recomposer l'audio complet ({queueAudioUrls.length} parties)
+                    </>
+                  )}
+                </button>
+              </motion.section>
+            )}
+        </AnimatePresence>
+
+        {/* Recomposed full audio player */}
+        <AnimatePresence>
+          {combinedAudioUrl && (
+            <motion.section
+              initial={{ opacity: 0, y: 10 }}
+              animate={{ opacity: 1, y: 0 }}
+              exit={{ opacity: 0, height: 0 }}
+            >
+              <AudioPlayer
+                audioUrl={combinedAudioUrl}
+                title="Audio complet recomposé"
+              />
+            </motion.section>
+          )}
+        </AnimatePresence>
+
         {/* Current file being processed */}
         <AnimatePresence>
           {isQueueMode && (isProcessing || waitingForNext) && currentFile && (
@@ -1227,6 +1547,52 @@ const Index = () => {
                 Traitement en cours : <strong className="text-foreground">{currentFile.name}</strong>
               </p>
             </motion.div>
+          )}
+        </AnimatePresence>
+
+        {/* Resume banner after an interrupted generation (sleep / reload) */}
+        <AnimatePresence>
+          {interrupted && !isProcessing && (
+            <motion.section
+              initial={{ opacity: 0, y: 10 }}
+              animate={{ opacity: 1, y: 0 }}
+              exit={{ opacity: 0, height: 0 }}
+              className="glass-card p-4 border border-primary/30"
+            >
+              <div className="flex items-start gap-3">
+                <AlertCircle className="w-5 h-5 text-primary flex-shrink-0 mt-0.5" />
+                <div className="flex-1 space-y-3">
+                  <div>
+                    <p className="text-sm font-medium text-foreground">
+                      Génération interrompue
+                    </p>
+                    <p className="text-sm text-muted-foreground">
+                      La génération a été interrompue (mise en veille ?). Vos
+                      textes sont conservés — vous pouvez reprendre sans
+                      réimporter de fichier.
+                    </p>
+                  </div>
+                  <div className="flex gap-2 flex-wrap">
+                    <button
+                      onClick={handleResume}
+                      className="flex items-center gap-2 px-4 py-2 rounded-lg bg-primary text-primary-foreground font-medium text-sm hover:opacity-90 transition-all"
+                    >
+                      <Mic className="w-4 h-4" />
+                      Reprendre la génération audio
+                    </button>
+                    <button
+                      onClick={() => {
+                        setInterrupted(false);
+                        clearSession();
+                      }}
+                      className="px-4 py-2 rounded-lg bg-muted text-muted-foreground font-medium text-sm hover:text-foreground transition-all"
+                    >
+                      Ignorer
+                    </button>
+                  </div>
+                </div>
+              </div>
+            </motion.section>
           )}
         </AnimatePresence>
 
@@ -1339,7 +1705,12 @@ const Index = () => {
                 audioChunks={audioChunks}
                 audioUrl={audioUrl || undefined}
                 isStreaming={isTtsStreaming}
-                title="Audio traduit"
+                coverImageUrl={coverImageUrl || undefined}
+                title={
+                  currentFile?.name
+                    ? `${currentFile.name} — Audio traduit`
+                    : "Audio traduit"
+                }
               />
             </motion.section>
           )}
@@ -1361,6 +1732,15 @@ const Index = () => {
                 Enregistrer / Telecharger
               </button>
 
+              {/* Generate cover image button */}
+              <button
+                onClick={() => setShowCoverDialog(true)}
+                className="flex-1 min-w-[200px] py-3 rounded-xl bg-muted border border-border text-foreground font-medium text-sm hover:bg-muted/80 transition-all flex items-center justify-center gap-2"
+              >
+                <ImageIcon className="w-4 h-4" />
+                {coverImageUrl ? "Modifier la couverture" : "Générer une couverture"}
+              </button>
+
               {/* Next file button in queue */}
               {waitingForNext && (
                 <button
@@ -1368,7 +1748,7 @@ const Index = () => {
                   className="flex-1 min-w-[200px] py-3 rounded-xl bg-primary text-primary-foreground font-medium text-sm hover:opacity-90 transition-all flex items-center justify-center gap-2 animate-pulse"
                 >
                   <SkipForward className="w-4 h-4" />
-                  Fichier suivant ({queueIndex + 2}/{selectedFiles.length})
+                  Fichier suivant ({queueIndex + 2}/{processingQueue.length})
                 </button>
               )}
             </motion.section>
@@ -1388,7 +1768,7 @@ const Index = () => {
                 className="flex-1 py-3 rounded-xl bg-primary text-primary-foreground font-medium text-sm hover:opacity-90 transition-all flex items-center justify-center gap-2"
               >
                 <SkipForward className="w-4 h-4" />
-                Passer au fichier suivant ({queueIndex + 2}/{selectedFiles.length})
+                Passer au fichier suivant ({queueIndex + 2}/{processingQueue.length})
               </button>
             </motion.section>
           )}
@@ -1438,7 +1818,7 @@ const Index = () => {
                 className="flex items-center gap-2 px-6 py-3 rounded-xl bg-primary text-primary-foreground font-medium text-sm hover:opacity-90 transition-all"
               >
                 <Radio className="w-4 h-4" />
-                Generer le Podcast
+                Générer le podcast
               </button>
             )}
           </div>
@@ -1482,8 +1862,19 @@ const Index = () => {
         transcription={transcription}
         translation={translation}
         targetLanguage={targetLang}
+        coverImageUrl={coverImageUrl || undefined}
         onDownloadVideo={(videoId || localVideoUrl) ? handleDownloadVideo : undefined}
         isDownloadingVideo={isDownloadingVideo}
+      />
+
+      {/* Cover Dialog */}
+      <CoverDialog
+        open={showCoverDialog}
+        onClose={() => setShowCoverDialog(false)}
+        audioUrl={audioUrl}
+        defaultTitle={saveTitle}
+        contentHint={summary || translation || transcription || undefined}
+        onGenerated={(url) => setCoverImageUrl(url)}
       />
     </div>
   );

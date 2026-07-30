@@ -1,8 +1,31 @@
 {
-  "name": "vocaleez-ai",
+  "name": "vocaleez",
   "private": true,
-  "version": "0.0.0",
+  "version": "1.0.0",
   "type": "module",
+  "description": "Vocaleez — outil local open-source de transcription, traduction, synthèse vocale (TTS), podcast multi-voix et génération de couverture. Mono-utilisateur, auto-hébergé.",
+  "license": "MIT",
+  "keywords": [
+    "transcription",
+    "translation",
+    "text-to-speech",
+    "whisper",
+    "podcast",
+    "tts",
+    "self-hosted",
+    "local-first"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/emdiakhate/harmony-voice.git"
+  },
+  "homepage": "https://github.com/emdiakhate/harmony-voice#readme",
+  "bugs": {
+    "url": "https://github.com/emdiakhate/harmony-voice/issues"
+  },
+  "engines": {
+    "node": ">=18"
+  },
   "scripts": {
     "dev": "concurrently -n client,server -c cyan,green \"vite\" \"tsx watch server/index.ts\"",
     "predev": "prisma db push",

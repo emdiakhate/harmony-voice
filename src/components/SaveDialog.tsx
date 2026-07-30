@@ -31,6 +31,7 @@ interface SaveDialogProps {
   transcription?: string;
   translation?: string;
   targetLanguage: string;
+  coverImageUrl?: string;
   onDownloadVideo?: () => void;
   isDownloadingVideo?: boolean;
 }
@@ -47,6 +48,7 @@ export default function SaveDialog({
   transcription,
   translation,
   targetLanguage,
+  coverImageUrl,
   onDownloadVideo,
   isDownloadingVideo,
 }: SaveDialogProps) {
@@ -75,7 +77,8 @@ export default function SaveDialog({
     setIsSaving(true);
 
     const thumbnailUrl =
-      videoId ? `https://img.youtube.com/vi/${videoId}/mqdefault.jpg` : null;
+      coverImageUrl ||
+      (videoId ? `https://img.youtube.com/vi/${videoId}/mqdefault.jpg` : null);
     const estimatedDuration = translation ? Math.ceil(translation.length / 15) : 0;
 
     try {
@@ -112,7 +115,8 @@ export default function SaveDialog({
     if (!vid) {
       setIsSaving(true);
       const thumbnailUrl =
-        videoId ? `https://img.youtube.com/vi/${videoId}/mqdefault.jpg` : null;
+        coverImageUrl ||
+        (videoId ? `https://img.youtube.com/vi/${videoId}/mqdefault.jpg` : null);
       const estimatedDuration = translation ? Math.ceil(translation.length / 15) : 0;
 
       try {
@@ -128,8 +132,7 @@ export default function SaveDialog({
             audioUrl: audioUrl || null,
             targetLanguage,
             durationSeconds: estimatedDuration,
-            thumbnailUrl:
-              videoId ? `https://img.youtube.com/vi/${videoId}/mqdefault.jpg` : null,
+            thumbnailUrl,
           }),
         });
         if (res.ok) {
@@ -160,7 +163,7 @@ export default function SaveDialog({
         setAddedToPlaylists((prev) => new Set([...prev, playlistId]));
         toast.success("Ajout a la playlist !");
       } else if (res.status === 409) {
-        toast.info("Deja dans cette playlist");
+        toast.info("Déjà dans cette playlist");
         setAddedToPlaylists((prev) => new Set([...prev, playlistId]));
       }
     } catch {
@@ -218,10 +221,21 @@ export default function SaveDialog({
           </div>
 
           <div className="p-6 space-y-4">
+            {/* Cover preview */}
+            {coverImageUrl && (
+              <div className="flex justify-center">
+                <img
+                  src={coverImageUrl}
+                  alt="Couverture"
+                  className="w-28 h-28 rounded-xl object-cover border border-border shadow-md"
+                />
+              </div>
+            )}
+
             {/* Download buttons */}
             <div className="space-y-2">
               <p className="text-xs font-medium text-muted-foreground uppercase tracking-wider">
-                Telecharger
+                Télécharger
               </p>
               <a
                 href={audioUrl}
@@ -229,7 +243,7 @@ export default function SaveDialog({
                 className="w-full py-3 rounded-xl bg-muted border border-border text-foreground font-medium text-sm hover:bg-muted/80 transition-all flex items-center justify-center gap-2"
               >
                 <Music className="w-4 h-4" />
-                Telecharger l'audio (.mp3)
+                Télécharger l'audio (.mp3)
               </a>
               {(videoId || localVideoUrl) && onDownloadVideo && (
                 <button
@@ -245,7 +259,7 @@ export default function SaveDialog({
                   ) : (
                     <>
                       <Download className="w-4 h-4" />
-                      Telecharger la video traduite (.mp4)
+                      Télécharger la vidéo traduite (.mp4)
                     </>
                   )}
                 </button>
@@ -255,7 +269,7 @@ export default function SaveDialog({
             {/* Save to library */}
             <div className="space-y-2">
               <p className="text-xs font-medium text-muted-foreground uppercase tracking-wider">
-                Bibliotheque
+                Bibliothèque
               </p>
               <button
                 onClick={handleSaveToLibrary}
@@ -297,7 +311,7 @@ export default function SaveDialog({
                 </div>
               ) : playlists.length === 0 ? (
                 <p className="text-sm text-muted-foreground text-center py-2">
-                  Aucune playlist. Creez-en une ci-dessous.
+                  Aucune playlist. Créez-en une ci-dessous.
                 </p>
               ) : (
                 <div className="space-y-1.5 max-h-40 overflow-y-auto">

@@ -10,17 +10,23 @@ import { downloadYouTubeAudio, downloadYouTubeVideo, mergeVideoAudio, extractVid
 import { transcribeAudio } from './services/transcriber.js';
 import { translateText, PartialTranslationError, detectLanguage } from './services/translator.js';
 import { splitForTTS, generateSpeechChunk, setEdgeTTSLang } from './services/tts.js';
+import { concatMp3Buffers } from './services/audio-concat.js';
 import { getPiperStatus } from './services/piper-tts.js';
 import { extractTextFromFile } from './services/document-parser.js';
 import { generatePodcastScript } from './services/podcast-generator.js';
 import { generatePodcastAudio, AVAILABLE_VOICES } from './services/podcast-tts.js';
-import { chatComplete, resolveLlmConfig, resolveTranscribeConfig, hasAnyProvider, type LlmConfigInput } from './services/llm/router.js';
+import { chatComplete, resolveLlmConfig, resolveTranscribeConfig, resolveImageConfig, hasAnyProvider, type LlmConfigInput } from './services/llm/router.js';
 import { loadUserKeys, injectKeys } from './services/llm/keystore.js';
+import { buildCoverPrompt, generateCoverImage, embedCoverArt, type CoverStyle } from './services/image-generator.js';
 import { encrypt, decrypt, maskKey, isEncryptionConfigured } from './lib/crypto.js';
 import { requireAuth } from './lib/auth.js';
 import { prisma } from './lib/prisma.js';
+import { checkSystemDependencies, logDependencyStatus } from './lib/preflight.js';
+import { applyLogLevel } from './lib/logger.js';
 
 config();
+// Applique le seuil LOG_LEVEL (défaut info) dès le chargement des variables d'env.
+applyLogLevel();
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
@@ -134,7 +140,7 @@ async function streamingTTS(
   const audioUrl = `/api/audio/${finalFileName}`;
 
   if (audioBuffers.length > 0) {
-    fs.writeFileSync(finalPath, Buffer.concat(audioBuffers));
+    fs.writeFileSync(finalPath, await concatMp3Buffers(audioBuffers));
     console.log(`[TTS] ${ttsError ? 'Partial' : 'Final'} audio saved: ${finalFileName} (${audioBuffers.length}/${ttsChunks.length} chunks)`);
   }
 
@@ -296,7 +302,7 @@ async function pipelinedTranslateAndTTS(
   const audioUrl = `/api/audio/${finalFileName}`;
 
   if (audioBuffers.length > 0) {
-    fs.writeFileSync(finalPath, Buffer.concat(audioBuffers));
+    fs.writeFileSync(finalPath, await concatMp3Buffers(audioBuffers));
     console.log(`[Pipeline] TTS ${ttsError ? 'partial' : 'done'}: ${ttsChunkFileCount} audio chunks generated`);
   }
 
@@ -801,6 +807,59 @@ ${inputText}`;
   }
 });
 
+// ===== Generate cover image (audiobook-style thumbnail) =====
+app.post('/api/generate-cover', requireAuth, upload.single('referenceImage'), async (req, res) => {
+  const user = (req as any).dbUser;
+  const refFile = req.file; // multer = disque ; req.file.path est un chemin temporaire
+  try {
+    const { title, author, subtitle, style, contentHint, audioUrl } = req.body || {};
+
+    const keyMap = await loadUserKeys(user.id);
+    const imageConfig = injectKeys(parseLlmConfig(req.body?.imageConfig), keyMap);
+    const attempts = resolveImageConfig(imageConfig);
+
+    // Image de référence optionnelle → data URL base64 (seul OpenRouter l'exploite).
+    let referenceImageDataUrl: string | undefined;
+    if (refFile) {
+      const buf = fs.readFileSync(refFile.path);
+      const mime = refFile.mimetype || 'image/png';
+      referenceImageDataUrl = `data:${mime};base64,${buf.toString('base64')}`;
+    }
+
+    const prompt = buildCoverPrompt({
+      title,
+      author,
+      subtitle,
+      style: (style as CoverStyle) || 'audiobook',
+      contentHint,
+    });
+
+    const buffer = await generateCoverImage({ prompt, referenceImageDataUrl, attempts });
+
+    const coverFileName = `cover_${Date.now()}.png`;
+    fs.writeFileSync(path.join(outputDir, coverFileName), buffer);
+    const coverImageUrl = `/api/audio/${coverFileName}`;
+
+    // Intégration ID3 best-effort dans le MP3 source (si fourni et présent sur disque).
+    if (audioUrl && typeof audioUrl === 'string') {
+      const audioName = path.basename(audioUrl); // sécurité: jamais hors de outputDir
+      const audioPath = path.join(outputDir, audioName);
+      if (audioName.toLowerCase().endsWith('.mp3') && fs.existsSync(audioPath)) {
+        await embedCoverArt(audioPath, path.join(outputDir, coverFileName));
+      }
+    }
+
+    res.json({ coverImageUrl });
+  } catch (error: any) {
+    console.error('[Cover] Error:', error?.message || error);
+    res.status(500).json({ error: error?.message || 'Erreur lors de la génération de la couverture.' });
+  } finally {
+    if (refFile) {
+      try { fs.unlinkSync(refFile.path); } catch {}
+    }
+  }
+});
+
 // ===== Generate podcast from existing translated text =====
 app.post('/api/generate-podcast', requireAuth, async (req, res) => {
   const user = (req as any).dbUser;
@@ -841,6 +900,14 @@ app.post('/api/generate-podcast', requireAuth, async (req, res) => {
   res.end();
 });
 
+// Décalage de démarrage de la voix (secondes). Borne [0, 3600] pour éviter des
+// valeurs négatives ou aberrantes qui feraient planter ffmpeg.
+function clampSpeechOffset(value: unknown): number {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return 0;
+  return Math.min(3600, Math.max(0, n));
+}
+
 // ===== Merge video + translated audio =====
 app.post('/api/merge-video', requireAuth, async (req, res) => {
   const { videoId, audioUrl, targetLanguage, speechStartOffset } = req.body;
@@ -866,7 +933,7 @@ app.post('/api/merge-video', requireAuth, async (req, res) => {
     const mergedPath = path.join(videoOutputDir, mergedFileName);
 
     console.log(`[Merge] Merging video + translated audio...`);
-    await mergeVideoAudio(videoPath, audioPath, mergedPath, targetLanguage, speechStartOffset || 0);
+    await mergeVideoAudio(videoPath, audioPath, mergedPath, targetLanguage, clampSpeechOffset(speechStartOffset));
 
     cleanupAudioFile(videoPath);
 
@@ -909,7 +976,7 @@ app.post('/api/merge-local-video', requireAuth, async (req, res) => {
     const mergedPath = path.join(videoOutputDir, mergedFileName);
 
     console.log(`[MergeLocal] Merging ${videoFileName} + ${audioFileName}...`);
-    await mergeVideoAudio(videoPath, audioPath, mergedPath, targetLanguage, speechStartOffset || 0);
+    await mergeVideoAudio(videoPath, audioPath, mergedPath, targetLanguage, clampSpeechOffset(speechStartOffset));
 
     const stats = fs.statSync(mergedPath);
     console.log(`[MergeLocal] Done: ${mergedFileName} (${(stats.size / 1024 / 1024).toFixed(1)}MB)`);
@@ -931,7 +998,11 @@ app.post('/api/split-pdf', requireAuth, upload.single('file'), async (req, res) 
     return res.status(400).json({ error: 'Aucun fichier fourni.' });
   }
 
-  const pagesPerChunk = Math.max(1, parseInt(req.body.pagesPerChunk || '12', 10));
+  // Borne 1–100 avec repli sur 12 si valeur absente/non numérique (parseInt → NaN).
+  const parsedPages = parseInt(req.body.pagesPerChunk, 10);
+  const pagesPerChunk = Number.isNaN(parsedPages)
+    ? 12
+    : Math.min(100, Math.max(1, parsedPages));
 
   try {
     const { PDFDocument } = await import('pdf-lib');
@@ -1115,6 +1186,49 @@ app.post('/api/combine-audio', requireAuth, upload.array('files', 50), async (re
   }
 });
 
+// ===== Combine already-generated audio chunks (already on server disk) into one =====
+// Reuses concatMp3Buffers (ffmpeg decode → resample → re-encode) so the recomposed file
+// has a correct header/duration and no speed glitches. No re-upload: the parts are read
+// straight from outputDir by basename (path traversal is impossible).
+app.post('/api/combine-chunks', requireAuth, async (req, res) => {
+  const { audioUrls, fileName } = req.body as { audioUrls?: string[]; fileName?: string };
+
+  if (!Array.isArray(audioUrls) || audioUrls.length < 2) {
+    return res.status(400).json({ error: 'Au moins 2 audios requis.' });
+  }
+
+  try {
+    const buffers: Buffer[] = [];
+    for (const url of audioUrls) {
+      const name = path.basename(String(url)); // sécurité: jamais hors de outputDir
+      const filePath = path.join(outputDir, name);
+      if (!fs.existsSync(filePath)) {
+        return res.status(404).json({ error: `Audio introuvable: ${name}` });
+      }
+      buffers.push(fs.readFileSync(filePath));
+    }
+
+    const combined = await concatMp3Buffers(buffers);
+
+    const safeBase = (fileName || 'document').replace(/[^a-z0-9_-]+/gi, '_').slice(0, 40) || 'document';
+    const outName = `combined_${safeBase}_${Date.now()}.mp3`;
+    const outPath = path.join(outputDir, outName);
+    fs.writeFileSync(outPath, combined);
+
+    const stats = fs.statSync(outPath);
+    console.log(`[CombineChunks] ${audioUrls.length} parties → ${outName} (${(stats.size / 1024 / 1024).toFixed(1)}MB)`);
+
+    res.json({
+      audioUrl: `/api/audio/${outName}`,
+      fileSize: `${(stats.size / 1024 / 1024).toFixed(1)}MB`,
+      partCount: audioUrls.length,
+    });
+  } catch (error: any) {
+    console.error('[CombineChunks] Error:', error.message);
+    res.status(500).json({ error: error.message || 'Erreur lors de la combinaison des audios.' });
+  }
+});
+
 // ===== Saved Videos =====
 app.post('/api/videos/save', requireAuth, async (req, res) => {
   const user = (req as any).dbUser;
@@ -1254,25 +1368,36 @@ async function testProviderKey(provider: string, key: string): Promise<boolean> 
       url = "https://api.elevenlabs.io/v1/user";
       headers["xi-api-key"] = key;
       break;
-    case "claude":
-      url = "https://api.anthropic.com/v1/models";
-      headers["x-api-key"] = key;
-      headers["anthropic-version"] = "2023-06-01";
-      break;
     default:
       return false;
   }
   try {
-    const r = await fetch(url, { headers });
+    // Timeout pour ne pas bloquer si le fournisseur ne répond pas.
+    const r = await fetch(url, { headers, signal: AbortSignal.timeout(8000) });
     return r.ok;
   } catch {
     return false;
   }
 }
 
+// Rate-limit léger en mémoire pour /test-key (endpoint sans auth). Usage local,
+// simple garde-fou contre les appels en boucle.
+const testKeyHits: number[] = [];
+function testKeyRateLimited(): boolean {
+  const now = Date.now();
+  while (testKeyHits.length && now - testKeyHits[0] > 10_000) testKeyHits.shift();
+  if (testKeyHits.length >= 15) return true;
+  testKeyHits.push(now);
+  return false;
+}
+
 app.post('/api/settings/test-key', async (req, res) => {
+  if (testKeyRateLimited()) {
+    res.status(429).json({ valid: false, error: 'Trop de tests. Réessayez dans quelques secondes.' });
+    return;
+  }
   const { provider, key } = req.body as { provider: string; key: string };
-  if (!provider || !key) {
+  if (!provider || typeof provider !== 'string' || !key || typeof key !== 'string') {
     res.json({ valid: false });
     return;
   }
@@ -1342,6 +1467,7 @@ app.delete('/api/settings/keys/:id', requireAuth, async (req, res) => {
 
 // Health check
 app.get('/api/health', (_req, res) => {
+  const deps = checkSystemDependencies();
   res.json({
     status: 'ok',
     openai: !!process.env.OPENAI_API_KEY,
@@ -1350,6 +1476,9 @@ app.get('/api/health', (_req, res) => {
     openrouter: !!process.env.OPENROUTER_API_KEY,
     elevenlabs: !!process.env.ELEVENLABS_API_KEY,
     piper: getPiperStatus(),
+    // Dépendances système externes (voir server/lib/preflight.ts).
+    ffmpeg: deps.ffmpeg,
+    ytdlp: deps.ytdlp,
   });
 });
 
@@ -1377,4 +1506,5 @@ app.listen(PORT, () => {
   console.log(`[Priority] Translation/LLM: Groq > OpenRouter > OpenAI`);
   console.log(`[Priority] TTS: ElevenLabs > OpenAI > Gemini > Edge TTS (free) | Podcast TTS: Gemini > ElevenLabs > OpenAI`);
   console.log(`[Priority] Whisper: Groq > OpenAI`);
+  logDependencyStatus();
 });

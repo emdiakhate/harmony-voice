@@ -406,7 +406,7 @@ const AudioCombiner = () => {
               className="w-full py-3 rounded-lg bg-primary text-primary-foreground font-medium text-sm hover:brightness-110 transition-all flex items-center justify-center gap-2"
             >
               <Download className="w-4 h-4" />
-              Telecharger l'audio combine
+              Télécharger l'audio combiné
             </button>
           </motion.div>
         )}

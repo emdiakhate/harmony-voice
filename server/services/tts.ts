@@ -6,6 +6,7 @@ import path from 'path';
 import { exec, execFile } from 'child_process';
 import { promisify } from 'util';
 import { isPiperAvailable, hasVoiceForLang, generateLongTextWithPiper } from './piper-tts.js';
+import { concatMp3Buffers } from './audio-concat.js';
 import { resolveTtsConfig, runWithFallback, type Attempt, type LlmConfigInput } from './llm/router.js';
 
 const execAsync = promisify(exec);
@@ -280,7 +281,7 @@ async function generateWithGoogleTTS(text: string, lang: string): Promise<Buffer
     }
   }
 
-  const finalBuffer = Buffer.concat(audioBuffers);
+  const finalBuffer = await concatMp3Buffers(audioBuffers);
   console.log(`[TTS] Google Translate TTS generated ${(finalBuffer.length / 1024).toFixed(1)}KB audio`);
   return finalBuffer;
 }
@@ -382,7 +383,7 @@ export async function generateSpeech(
     onProgress?.(Math.round(((i + 1) / chunks.length) * 100));
   }
 
-  const finalBuffer = Buffer.concat(audioBuffers);
+  const finalBuffer = await concatMp3Buffers(audioBuffers);
   fs.writeFileSync(outputPath, finalBuffer);
 
   console.log(`[TTS] Audio saved to ${outputPath} (${(finalBuffer.length / 1024 / 1024).toFixed(2)} MB)`);
